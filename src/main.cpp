@@ -436,7 +436,7 @@ void loop() {
 
           ctrl.error = sys.referencia - meas.RPMPromedio;
 
-          if (sys.tab_activo == 4){
+          if (sys.tab_activo == 5){
             switch (ctrl.PIDtype) {
               case 0:  ctrl.controladorOUT = PID_incremental();       break;
               case 1:  ctrl.controladorOUT = PID_positional_Tustin(); break;
@@ -451,7 +451,7 @@ void loop() {
               ctrl.PWMOUT         = 0;
             }
           }
-          else if (sys.tab_activo == 6){
+          else if (sys.tab_activo == 8){
             ctrl.controladorOUT = EcuacionDiferencias();
             if (sys.referencia != 0){
               ctrl.PWMOUT = ctrl.controladorOUT + ctrl.ZM;
@@ -475,12 +475,12 @@ void loop() {
           if (timing.tiempociclo < 1) timing.tiempociclo = timing.delayintencional;
 
           float u = 0;
-          if (sys.tab_activo == 4) {
+          if (sys.tab_activo == 5) {
             switch (ctrl.PIDtype) {
               case 0: u = PID_incremental();       break;
               case 1: u = PID_positional_Tustin(); break;
             }
-          } else if (sys.tab_activo == 6) {
+          } else if (sys.tab_activo == 8) {
             u = EcuacionDiferencias();
           }
           u = constrain(u, -255, 255);
