@@ -129,6 +129,23 @@ void divideString(String DatoSerial, char delimitador, String salida[], int limi
   salida[indice] = DatoSerial;
 }
 
+void resetControllerMemory() {
+  for (int i = 0; i < 5; i++) {
+    ctrl.x[i] = 0.0f;
+    ctrl.y[i] = 0.0f;
+  }
+
+  ctrl.error = 0.0f;
+  ctrl.integral_sum = 0.0f;
+  ctrl.dFiltered = 0.0f;
+  ctrl.previousError = 0.0f;
+  ctrl.previousOutput = 0.0f;
+  ctrl.controladorOUT = 0.0f;
+  ctrl.PWMOUT = 0;
+  ctrl.d_y = 0.0f;
+  ctrl.d_out_prev = 0.0f;
+}
+
 void inicializaVariables() {
   sys.referencia = 0;
   sys.medicion = 0;
@@ -136,15 +153,9 @@ void inicializaVariables() {
   timing.tiempoanterior = 0;
   timing.tiempociclo = 0;
   enc.encoderTicks = 0;
-  ctrl.controladorOUT = 0;
-  ctrl.error = 0;
-  ctrl.previousError = 0;
-  ctrl.previousOutput = 0;
   enc.lastEncoded = 0;
   sys.deg = 0;
-  ctrl.d_y = 0.0f;          // estado D del posicional
-  ctrl.d_out_prev = 0.0f;   // estado D del incremental
-  ctrl.integral_sum = 0.0f; // por si acaso
+  resetControllerMemory();
 
   RPMAvg.reset();
   FilteredCurrent.reset();
@@ -409,6 +420,7 @@ void loop() {
     if (sys.inicio == 1) {
       switch (sys.modooperacion) {
         case 0: // Inhabilitado
+          resetControllerMemory();
           analogWrite(pins.pwmPin, 0);
           delay(50);
           break;
@@ -445,10 +457,7 @@ void loop() {
               ctrl.PWMOUT = ctrl.controladorOUT + ctrl.ZM; // zona muerta solo si ref ≠ 0
               ctrl.PWMOUT = constrain(ctrl.PWMOUT, 0, 255);
             } else {
-              ctrl.previousOutput = 0;
-              ctrl.previousError  = 0;
-              ctrl.controladorOUT = 0;
-              ctrl.PWMOUT         = 0;
+              resetControllerMemory();
             }
           }
           else if (sys.tab_activo == 8){
@@ -457,10 +466,7 @@ void loop() {
               ctrl.PWMOUT = ctrl.controladorOUT + ctrl.ZM;
               ctrl.PWMOUT = constrain(ctrl.PWMOUT, 0, 255);
             } else {
-              ctrl.previousOutput = 0;
-              ctrl.previousError  = 0;
-              ctrl.controladorOUT = 0;
-              ctrl.PWMOUT         = 0;
+              resetControllerMemory();
             }
           }
           analogWrite(pins.pwmPin, ctrl.PWMOUT);
@@ -539,6 +545,7 @@ void loop() {
       #endif
     } 
     else {
+      resetControllerMemory();
       analogWrite(pins.pwmPin, 0);
       delay(10);
     }
