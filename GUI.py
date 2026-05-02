@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from scipy.optimize import curve_fit, minimize
+from scipy.optimize import least_squares, minimize
 from scipy.signal import cont2discrete
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -1747,7 +1747,8 @@ class PortSelectDialog(QDialog):
 class MyDialog(QtWidgets.QDialog):
     def __init__(self, port=None, parent=None):
         super(MyDialog, self).__init__(parent)
-        uic.loadUi('QtDesignerGUI.ui', self)  # load the UI first
+        ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "QtDesignerGUI.ui")
+        uic.loadUi(ui_path, self)  # load the UI first
         # ---- make the dialog look/behave like a normal resizable window ----
         flags = self.windowFlags()
         flags |= Qt.WindowType.WindowSystemMenuHint          # show system menu
@@ -1785,18 +1786,19 @@ class MyDialog(QtWidgets.QDialog):
                                      f"Could not open port {port}:\n{e}")
                 self.serial_port = None
 
-        print("=== tabWidget order ===")
-        for i in range(self.tabWidget.count()):
-            print(i, self.tabWidget.tabText(i))
+        if os.environ.get("OPENMCT_DEBUG_TABS"):
+            print("=== tabWidget order ===")
+            for i in range(self.tabWidget.count()):
+                print(i, self.tabWidget.tabText(i))
 
         # Initialize data lists
-        self.header_written = False
-        self.reference.setVisible(False)
-        self.reference_label.setVisible(False)
-        self.slider.setVisible(False)
-        self.slider_label.setVisible(False)
-        self.manualinput.setVisible(False)
-        self.automaticinput.setVisible(False)
+        #self.header_written = False
+        #self.reference.setVisible(True)
+        #self.reference_label.setVisible(True)
+        #self.slider.setVisible(True)
+        #self.slider_label.setVisible(False)
+        #self.manualinput.setVisible(True)
+        #self.automaticinput.setVisible(True)
 
         datapoints = 1000
         self.dataRPM_setpoint = deque(maxlen=datapoints)
@@ -1814,8 +1816,8 @@ class MyDialog(QtWidgets.QDialog):
             "System Identification": "1",
             "Speed Control": "2",
             "Position Control": "3",
-            "Speed - manual": "4",
-            "Position - manual": "5",
+            "Speed - manual": "2",
+            "Position - manual": "3",
         }
 
         # Set placeholder texts (optional, but user-friendly)
@@ -1863,7 +1865,7 @@ class MyDialog(QtWidgets.QDialog):
         self.plant_den2.setPlaceholderText("s^2")
         self.plant_den1.setPlaceholderText("s^1")
         self.plant_den0.setPlaceholderText("s^0")
-        
+
         self.rlocus_num3.setPlaceholderText("s^3")
         self.rlocus_num2.setPlaceholderText("s^2")
         self.rlocus_num1.setPlaceholderText("s^1")
@@ -1889,6 +1891,10 @@ class MyDialog(QtWidgets.QDialog):
         self.grupo_checkboxes.addButton(self.automaticinput, 0)
         self.grupo_checkboxes.setExclusive(True)
         self.automaticinput.setChecked(True)
+        self.manualinput.toggled.connect(self._on_reference_source_changed)
+        self.automaticinput.toggled.connect(self._on_reference_source_changed)
+
+        self.saveValuesCheckBox.toggled.connect(self._on_save_values_toggled)
 
         self.grupo_identificationdata = QButtonGroup(self)
         self.grupo_identificationdata.addButton(self.identdatagraph, 1)
@@ -1917,6 +1923,7 @@ class MyDialog(QtWidgets.QDialog):
         # Define el botón de start/stop
         self.StartStop.clicked.connect(self.toggleStartStop)
         self.isRunning = False
+        self._configure_static_ui()
 
         # Realiza la discretización
         self.discretize.clicked.connect(self.discretize_function)
@@ -1968,7 +1975,7 @@ class MyDialog(QtWidgets.QDialog):
         self.legendPWM.anchor(itemPos=(1,0), parentPos=(1,0), offset=(10, -10))
         pi = self.graphWidgetPWM.getPlotItem()
         pi.setLabel('left',   'uController output', units='PWM')
-        pi.setLabel('bottom', 'Time',  units='s') 
+        pi.setLabel('bottom', 'Time',  units='s')
         self.graphWidgetPWM.setYRange(0, 255)
         placeholderLayoutPWM.replaceWidget(self.PWM, self.graphWidgetPWM)
         self.PWM.deleteLater()
@@ -2035,6 +2042,10 @@ class MyDialog(QtWidgets.QDialog):
         self.tuner_output_min.setText("0")
         self.tuner_output_max.setText("255")
         self.sampling_time.setText("0.02")
+        self.tabWidget.blockSignals(True)
+        self.tabWidget.setCurrentIndex(0)
+        self.tabWidget.blockSignals(False)
+        self._update_reference_controls_visibility()
 
         # Comienza todos los timers
         self.timer.start()
@@ -2091,6 +2102,100 @@ class MyDialog(QtWidgets.QDialog):
 
         self.textBrowser.setText("Controlador desconectado, esperando reconexión")
         return False
+
+    def _configure_static_ui(self):
+        self.tabWidget.setUsesScrollButtons(True)
+        tab_bar = self.tabWidget.tabBar()
+        tab_bar.setStyleSheet("""
+            QTabBar::scroller {
+                width: 60px;
+            }
+            QTabBar QToolButton {
+                min-width: 30px;
+                min-height: 30px;
+                padding: 2px;
+                margin: 0 2px;
+                border: 1px solid #c8ced8;
+                border-radius: 5px;
+                background: #f6f7f9;
+            }
+            QTabBar QToolButton:hover {
+                background: #e9eef7;
+            }
+            QTabBar QToolButton:pressed {
+                background: #dbe4f2;
+            }
+        """)
+
+        font = self.StartStop.font()
+        font.setBold(True)
+        self.StartStop.setFont(font)
+
+        self._style_tab_scroll_buttons()
+        QTimer.singleShot(0, self._style_tab_scroll_buttons)
+
+    def _style_tab_scroll_buttons(self):
+        tab_bar = self.tabWidget.tabBar()
+        for button in tab_bar.findChildren(QtWidgets.QToolButton):
+            button.setMinimumSize(30, 30)
+            button.setIconSize(QtCore.QSize(18, 18))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setAutoRaise(False)
+
+    def _on_save_values_toggled(self, checked):
+        self.header_written = False
+
+    def _reference_controls_enabled_for_mode(self):
+        return True
+
+    def _update_reference_controls_visibility(self):
+        show_source = self._reference_controls_enabled_for_mode()
+
+        for widget in (self.manualinput, self.automaticinput):
+            widget.setVisible(show_source)
+
+        for widget in (self.reference, self.reference_label, self.slider):
+            widget.setVisible(True)
+
+        self.slider_label.setVisible(False)
+
+    def _on_reference_source_changed(self, checked=False):
+        self._update_reference_controls_visibility()
+        if not checked:
+            return
+        if hasattr(self, "graphWidgetRPM"):
+            self.toggleupdate_parameters()
+
+    def _numeric_text(self, widget, default=0.0, minimum=None, maximum=None, integer=False):
+        text = widget.text().strip() if hasattr(widget, "text") else str(widget).strip()
+        if not text:
+            value = default
+        else:
+            try:
+                value = float(text.replace(",", "."))
+            except ValueError:
+                value = default
+
+        if minimum is not None:
+            value = max(float(minimum), value)
+        if maximum is not None:
+            value = min(float(maximum), value)
+
+        if integer:
+            return str(int(round(value)))
+        return f"{value:.9g}"
+
+    def _set_plot_y_range(self, plot_widget, ymin, ymax, include_zero=False):
+        if not np.isfinite(ymin) or not np.isfinite(ymax):
+            return
+        if include_zero:
+            ymin = min(0.0, ymin)
+            ymax = max(0.0, ymax)
+        if ymax < ymin:
+            ymin, ymax = ymax, ymin
+        span = ymax - ymin
+        margin = max(1.0, abs(ymax) * 0.1, abs(ymin) * 0.1) if span < 1e-9 else span * 0.1
+        plot_widget.setYRange(ymin - margin, ymax + margin)
 
     def Simulate(self):
         try:
@@ -2705,7 +2810,7 @@ class MyDialog(QtWidgets.QDialog):
             raise ValueError(f"Unsupported controller type: {ctype}")
 
         return ctrl.minreal(C, verbose=False)
-    
+
     def _update_pid_tuner(self):
         if self.tuner_loaded_plant is None:
             self.tuner_kp.setText("")
@@ -3477,9 +3582,13 @@ class MyDialog(QtWidgets.QDialog):
 
         except Exception as e:
             self.discretizationresult.setText(f"Error: {e}")
-    
+
     def resize_deque(self):
-        datapoints = int(self.datapoints.text())
+        try:
+            datapoints = int(float(self.datapoints.text().strip()))
+        except ValueError:
+            return
+        datapoints = max(1, datapoints)
         self.dataRPM_setpoint = deque(list(self.dataRPM_setpoint)[-datapoints:], maxlen=datapoints)
         self.dataRPM_measured = deque(list(self.dataRPM_measured)[-datapoints:], maxlen=datapoints)
         self.dataPWM = deque(list(self.dataPWM)[-datapoints:], maxlen=datapoints)
@@ -3678,44 +3787,42 @@ class MyDialog(QtWidgets.QDialog):
                 print("Plot error:", e)
 
     def sendModeOperation(self):
-        selected_text = self.modooperacion.currentText()
-        _ = self.mode_map.get(selected_text, "0")
-        # value is sent on toggleupdate_parameters
+        self._update_reference_controls_visibility()
+        if hasattr(self, "graphWidgetRPM"):
+            self.toggleupdate_parameters()
 
     def tabChanged(self):
         self.toggleupdate_parameters()
 
     def toggleupdate_parameters(self):
         # Collect the current values from UI elements or class variables
-        StartStop = '0' if self.StartStop.text()=="Start" else '1'
-        A = self.A.text()
-        B = self.B.text()
-        C = self.C.text()
-        D = self.D.text()
-        E = self.E.text()
-        F = self.F.text()
-        G = self.G.text()
-        H = self.H.text()
-        serial_txt = self.serial_in.text()
-        reference = self.reference.text()
-        delay =  self.delay.text()
+        StartStop = '0' if self.StartStop.text() == "Start" else '1'
+        A = self._numeric_text(self.A)
+        B = self._numeric_text(self.B)
+        C = self._numeric_text(self.C)
+        D = self._numeric_text(self.D)
+        E = self._numeric_text(self.E)
+        F = self._numeric_text(self.F)
+        G = self._numeric_text(self.G)
+        H = self._numeric_text(self.H)
+        delay = self._numeric_text(self.delay, default=1, minimum=1, integer=True)
         # Send the data
         tiporef = int(self.automaticinput.isChecked())
         tiposenal = self.tiposenal.currentIndex()
         selected_text = self.modooperacion.currentText()
         selected_mode = self.mode_map.get(selected_text, "0")
-        tiemporeferencia = self.tiemporeferencia.text()
-        amplitud = self.amplitude.text()
-        referenciaManual = self.reference.text()
-        offset = self.offset.text()
+        tiemporeferencia = self._numeric_text(self.tiemporeferencia, default=1, minimum=1, integer=True)
+        amplitud = self._numeric_text(self.amplitude, default=0, integer=True)
+        referenciaManual = self._numeric_text(self.reference, default=0, integer=True)
+        offset = self._numeric_text(self.offset, default=0, integer=True)
         activetab = self.tabWidget.currentIndex()
-        Kp = self.Kp.text()
-        Ki = self.Ki.text()
-        Kd = self.Kd.text()
-        deadzone = self.deadzone.text()
-        time_constant = self.time_constant.text()
+        Kp = self._numeric_text(self.Kp)
+        Ki = self._numeric_text(self.Ki)
+        Kd = self._numeric_text(self.Kd)
+        deadzone = self._numeric_text(self.deadzone, default=0, minimum=0, maximum=255, integer=True)
+        time_constant = self._numeric_text(self.time_constant, default=0.01, minimum=1e-6)
         PIDtype = self.PIDtype.currentIndex()
-        reset_time = self.reset_time.text()
+        reset_time = self._numeric_text(self.reset_time, default=0.1, minimum=1e-6)
         self.SendData(StartStop, selected_mode, A, B, C, D, E, F, G, H, delay, tiemporeferencia, amplitud, referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time)
         if not self.controller_connected:
             self.textBrowser.setText("Controlador desconectado, esperando reconexión")
@@ -3723,7 +3830,7 @@ class MyDialog(QtWidgets.QDialog):
             self.textBrowser.setText("System disabled, select an operation mode before starting")
         elif selected_text != "Disabled":
             self.textBrowser.setText("")
-        if selected_mode == "0" or selected_mode == "1" :
+        if selected_mode == "0" or selected_mode == "1":
             pi = self.graphWidgetRPM.getPlotItem()
             pi.setLabel('left', 'Motor Input / Output', units='PWM / RPM')
         if selected_mode == "2":
@@ -3744,6 +3851,169 @@ class MyDialog(QtWidgets.QDialog):
             self.StartStop.setText("Stop")
             self.StartAction()
         self.isRunning = not self.isRunning
+
+    def _estimate_static_gain(self, u, y):
+        u = np.asarray(u, dtype=float).ravel()
+        y = np.asarray(y, dtype=float).ravel()
+        if len(u) == 0 or len(y) == 0:
+            return 1.0
+
+        mask = np.abs(u) > max(1e-9, 0.05 * float(np.max(np.abs(u))))
+        if np.any(mask):
+            uu = u[mask]
+            yy = y[mask]
+        else:
+            uu = u
+            yy = y
+
+        denom = float(np.dot(uu, uu))
+        if denom <= 1e-12:
+            return 1.0
+
+        gain = float(np.dot(uu, yy) / denom)
+        if not np.isfinite(gain) or abs(gain) < 1e-9:
+            return 1.0
+        return gain
+
+    def _identification_initial_guesses(self, numorder, denorder, time, u, y):
+        gain = self._estimate_static_gain(u, y)
+        duration = max(float(time[-1] - time[0]), 1e-3)
+        Ts = float(np.median(np.diff(time))) if len(time) > 2 else duration
+        Ts = max(Ts, 1e-4)
+
+        tau_candidates = [
+            2 * Ts, 4 * Ts, 8 * Ts, 12 * Ts,
+            duration / 80.0, duration / 40.0, duration / 20.0,
+            duration / 10.0, duration / 5.0,
+        ]
+        tau_candidates = sorted({
+            float(np.clip(tau, 2 * Ts, duration))
+            for tau in tau_candidates
+            if np.isfinite(tau) and tau > 0
+        })
+
+        guesses = []
+
+        def add_guess(den_tail):
+            den = np.r_[1.0, np.asarray(den_tail, dtype=float)]
+            if len(den) != denorder + 1:
+                return
+            if not np.all(np.isfinite(den)):
+                return
+
+            num = np.zeros(numorder + 1, dtype=float)
+            dc_den = den[-1] if denorder > 0 else 1.0
+            num[-1] = gain * dc_den
+            guess = np.r_[num, den[1:]]
+            if np.all(np.isfinite(guess)):
+                guesses.append(guess)
+
+        if denorder == 0:
+            add_guess([])
+        elif denorder == 1:
+            for tau in tau_candidates:
+                add_guess([1.0 / tau])
+        elif denorder == 2:
+            for tau in tau_candidates:
+                wn = 1.0 / tau
+                for zeta in (0.45, 0.7, 1.0, 1.4, 2.0):
+                    add_guess([2.0 * zeta * wn, wn * wn])
+        else:
+            for tau in tau_candidates:
+                poles = np.array([-1.0 / (tau * (1.0 + 0.35 * i)) for i in range(denorder)])
+                den = np.poly(poles).real
+                add_guess(den[1:])
+
+        legacy = np.ones(numorder + 1 + denorder, dtype=float)
+        if denorder > 0:
+            legacy[numorder + 1:] = np.maximum(legacy[numorder + 1:], 1e-6)
+        guesses.append(legacy)
+
+        unique = []
+        seen = set()
+        for guess in guesses:
+            key = tuple(np.round(guess, 9))
+            if key not in seen:
+                seen.add(key)
+                unique.append(guess)
+        return unique
+
+    def _simulate_identified_model(self, theta, numorder, denorder, time, u):
+        theta = np.asarray(theta, dtype=float).ravel()
+        num = theta[:numorder + 1]
+        den = np.r_[1.0, theta[numorder + 1:]]
+        sys_tf = ctrl.TransferFunction(num, den)
+        _, yout = ctrl.forced_response(sys_tf, T=time, U=u)
+        return sys_tf, np.asarray(yout, dtype=float).ravel()
+
+    def _fit_transfer_function(self, numorder, denorder, time, u, y):
+        if numorder > denorder:
+            raise ValueError("Numerator order must be less than or equal to denominator order.")
+
+        y_scale = max(float(np.std(y)), 1.0)
+        stability_margin = 1e-6
+        n_params = numorder + 1 + denorder
+
+        lower = np.full(n_params, -np.inf, dtype=float)
+        upper = np.full(n_params, np.inf, dtype=float)
+        if denorder > 0:
+            lower[numorder + 1:] = 1e-9
+
+        def residual(theta):
+            try:
+                sys_tf, yout = self._simulate_identified_model(theta, numorder, denorder, time, u)
+                if len(yout) != len(y) or not np.all(np.isfinite(yout)):
+                    return np.full(len(y) + denorder, 1e6, dtype=float)
+
+                err = (yout - y) / y_scale
+                poles = np.asarray(ctrl.poles(sys_tf), dtype=complex).ravel()
+                unstable = np.maximum(poles.real + stability_margin, 0.0)
+                penalty = 100.0 * unstable
+                return np.r_[err, penalty]
+            except Exception:
+                return np.full(len(y) + denorder, 1e6, dtype=float)
+
+        best = None
+        for guess in self._identification_initial_guesses(numorder, denorder, time, u, y):
+            x0 = np.asarray(guess, dtype=float)
+            if len(x0) != n_params:
+                continue
+            x0 = np.minimum(np.maximum(x0, lower + 1e-9), upper)
+
+            try:
+                result = least_squares(
+                    residual,
+                    x0,
+                    bounds=(lower, upper),
+                    loss="soft_l1",
+                    f_scale=0.5,
+                    x_scale="jac",
+                    max_nfev=3000,
+                )
+                sys_tf, yfit = self._simulate_identified_model(result.x, numorder, denorder, time, u)
+                if not np.all(np.isfinite(yfit)):
+                    continue
+
+                poles = np.asarray(ctrl.poles(sys_tf), dtype=complex).ravel()
+                stable = bool(np.all(poles.real < -stability_margin)) if denorder > 0 else True
+                rmse = float(np.sqrt(np.mean((y - yfit) ** 2)))
+                score = rmse if stable else rmse + 1e6
+
+                if best is None or score < best["score"]:
+                    best = {
+                        "score": score,
+                        "rmse": rmse,
+                        "stable": stable,
+                        "system": sys_tf,
+                        "yfit": yfit,
+                    }
+            except Exception:
+                continue
+
+        if best is None:
+            raise RuntimeError("System identification optimizer did not converge.")
+
+        return best["system"], best["yfit"], best["stable"]
 
     def identify_system(self):
         try:
@@ -3794,31 +4064,17 @@ class MyDialog(QtWidgets.QDialog):
                 y = np.interp(time_uniform, time, y)
                 time = time_uniform
 
-            # ---- 4) Model used by curve_fit ----
-            def transfer_function_fit(t, *coefficients):
-                # coefficients = [b0, b1, ..., a1, a2, ...]  (denominator leading 1)
-                num_coeffs = coefficients[:numorder + 1]
-                den_tail   = coefficients[numorder + 1:]
-                den_coeffs = np.insert(den_tail, 0, 1.0)
-
-                sys_tf = ctrl.TransferFunction(num_coeffs, den_coeffs)
-                # Simulate with same input/ time vectors used in curve_fit
-                _, yout = ctrl.forced_response(sys_tf, T=t, U=u)
-                return yout
-
-            # ---- 5) Initial guess and fit ----
-            initial_guess = [1.0] * (numorder + 1 + denorder)
-            popt, _ = curve_fit(transfer_function_fit, time, y, p0=initial_guess, maxfev=5000)
-
-            # ---- 6) Build identified TF and show it ----
-            num_fitted = popt[:numorder + 1]
-            den_fitted = np.insert(popt[numorder + 1:], 0, 1.0)
-            identified_system = ctrl.TransferFunction(num_fitted, den_fitted)
+            # ---- 4) Stable multistart fit ----
+            identified_system, y_identified, stable_fit = self._fit_transfer_function(
+                numorder, denorder, time, u, y
+            )
             self.identified_sys_tf = identified_system
-            self.identificationresult.setText(f"Identified Transfer Function:\n{identified_system}")
+            stability_note = "" if stable_fit else "\n\nWarning: best fit is not strictly stable."
+            self.identificationresult.setText(
+                f"Identified Transfer Function:\n{identified_system}{stability_note}"
+            )
 
-            # ---- 7) Plot response vs measured ----
-            _, y_identified = ctrl.forced_response(identified_system, T=time, U=u)
+            # ---- 5) Plot response vs measured ----
 
             y_min = float(min(np.min(y_identified), np.min(y)))
             y_max = float(max(np.max(y_identified), np.max(y)))
@@ -3871,6 +4127,8 @@ class MyDialog(QtWidgets.QDialog):
                 with open(filepath, 'w', newline='') as f:
                     f.write(header)
                 self.header_written = True
+            elif not self.saveValuesCheckBox.isChecked():
+                self.header_written = False
 
             # Read & process all available lines
             try:
@@ -3917,7 +4175,7 @@ class MyDialog(QtWidgets.QDialog):
             dt_s = np.asarray(self.dataDT, dtype=float)[-N:] * 1e-3
             t = np.cumsum(dt_s); t -= t[0]
 
-            if len(t) > 0:
+            if len(t) > 1 and float(t[-1]) > float(t[0]):
                 xmin = float(t[0])
                 xmax = float(t[-1])
                 self.graphWidgetRPM.setXRange(xmin, xmax, padding=0)
@@ -3934,10 +4192,11 @@ class MyDialog(QtWidgets.QDialog):
             if "Position" in self.modooperacion.currentText():
                 ymin = float(min(y_sp.min(initial=0), y_mea.min(initial=0)))
                 ymax = float(max(y_sp.max(initial=0), y_mea.max(initial=0)))
-                self.graphWidgetRPM.setYRange(ymin*1.1, ymax*1.1)
+                self._set_plot_y_range(self.graphWidgetRPM, ymin, ymax)
             else:
-                self.graphWidgetRPM.setYRange(0, max(1.0, float(max(y_sp.max(initial=0), y_mea.max(initial=0)))) * 1.1)
-            self.graphWidgetPWM.setYRange(0, max(1.0, float(y_pwm.max(initial=0))) * 1.1)
+                ymax = float(max(y_sp.max(initial=0), y_mea.max(initial=0), 1.0))
+                self._set_plot_y_range(self.graphWidgetRPM, 0.0, ymax, include_zero=True)
+            self._set_plot_y_range(self.graphWidgetPWM, 0.0, float(max(y_pwm.max(initial=0), 1.0)), include_zero=True)
 
         except Exception as e:
             print("update_graph error:", e)
@@ -3955,19 +4214,27 @@ class MyDialog(QtWidgets.QDialog):
 
     def StartAction(self):
         print("Inicio control motor")
-        StartStop=b'1'
         self.toggleupdate_parameters()
 
     def StopAction(self):
         print("Paro de control de motor")
-        StartStop=b'0'
         self.toggleupdate_parameters()
+
+    def closeEvent(self, event):
+        try:
+            self.StartStop.setText("Start")
+            self.isRunning = False
+            if self.serial_port is not None and (not hasattr(self.serial_port, "is_open") or self.serial_port.is_open):
+                self.toggleupdate_parameters()
+                self.serial_port.close()
+        except Exception as e:
+            print(f"closeEvent serial cleanup error: {e}")
+        super().closeEvent(event)
 
     def SendData(self, StartStop, selected_mode, A, B, C, D, E, F, G, H,delay,tiemporeferencia,amplitud,referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time):
         data_string=f"{StartStop},{selected_mode},{A},{B},{C},{D},{E},{F},{G},{H},{delay},{tiemporeferencia},{amplitud},{referenciaManual},{offset},{tiposenal},{activetab},{Kp},{Ki},{Kd},{deadzone},{time_constant},{PIDtype},{tiporef},{reset_time}"
-        data_bytes = data_string.encode('utf-8')
-        self.serial_out.setText(str(data_bytes))
         data_bytes = (data_string + '\n').encode('utf-8')
+        self.serial_out.setText(data_string)
         if self.serial_port is None or (hasattr(self.serial_port, "is_open") and not self.serial_port.is_open):
             self._try_reconnect_serial()
             return

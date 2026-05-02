@@ -23,30 +23,9 @@
     <rect>
      <x>10</x>
      <y>50</y>
-     <width>171</width>
-     <height>91</height>
+     <width>181</width>
+     <height>71</height>
     </rect>
-   </property>
-  </widget>
-  <widget class="QCheckBox" name="saveValuesCheckBox">
-   <property name="enabled">
-    <bool>true</bool>
-   </property>
-   <property name="geometry">
-    <rect>
-     <x>10</x>
-     <y>160</y>
-     <width>91</width>
-     <height>21</height>
-    </rect>
-   </property>
-   <property name="font">
-    <font>
-     <pointsize>9</pointsize>
-    </font>
-   </property>
-   <property name="text">
-    <string>Save values?</string>
    </property>
   </widget>
   <widget class="QLabel" name="dateTimeLabel">
@@ -81,26 +60,10 @@
    <property name="geometry">
     <rect>
      <x>10</x>
-     <y>200</y>
+     <y>150</y>
      <width>51</width>
      <height>20</height>
     </rect>
-   </property>
-  </widget>
-  <widget class="QLabel" name="delay_label">
-   <property name="geometry">
-    <rect>
-     <x>10</x>
-     <y>180</y>
-     <width>91</width>
-     <height>16</height>
-    </rect>
-   </property>
-   <property name="toolTip">
-    <string>Time delay between loops. Sampling time for discrete systems.</string>
-   </property>
-   <property name="text">
-    <string>Sampling time (ms)</string>
    </property>
   </widget>
   <widget class="QWidget" name="verticalLayoutWidget_2">
@@ -121,69 +84,44 @@
   <widget class="QLineEdit" name="reference">
    <property name="geometry">
     <rect>
-     <x>900</x>
-     <y>540</y>
+     <x>10</x>
+     <y>295</y>
      <width>51</width>
-     <height>16</height>
+     <height>21</height>
     </rect>
    </property>
   </widget>
   <widget class="QLabel" name="reference_label">
    <property name="geometry">
     <rect>
-     <x>900</x>
-     <y>520</y>
-     <width>61</width>
+     <x>10</x>
+     <y>270</y>
+     <width>121</width>
      <height>16</height>
     </rect>
    </property>
    <property name="text">
-    <string>Reference</string>
+    <string>Manual reference</string>
    </property>
   </widget>
   <widget class="QPushButton" name="StartStop">
    <property name="geometry">
     <rect>
-     <x>10</x>
-     <y>400</y>
-     <width>111</width>
-     <height>51</height>
+     <x>645</x>
+     <y>485</y>
+     <width>136</width>
+     <height>86</height>
     </rect>
+   </property>
+   <property name="font">
+    <font>
+     <pointsize>14</pointsize>
+     <weight>75</weight>
+     <bold>true</bold>
+    </font>
    </property>
    <property name="text">
     <string>Start</string>
-   </property>
-  </widget>
-  <widget class="QCheckBox" name="manualinput">
-   <property name="enabled">
-    <bool>true</bool>
-   </property>
-   <property name="geometry">
-    <rect>
-     <x>940</x>
-     <y>560</y>
-     <width>91</width>
-     <height>16</height>
-    </rect>
-   </property>
-   <property name="text">
-    <string>Manual input</string>
-   </property>
-  </widget>
-  <widget class="QCheckBox" name="automaticinput">
-   <property name="enabled">
-    <bool>true</bool>
-   </property>
-   <property name="geometry">
-    <rect>
-     <x>1010</x>
-     <y>550</y>
-     <width>131</width>
-     <height>16</height>
-    </rect>
-   </property>
-   <property name="text">
-    <string>Automatic input</string>
    </property>
   </widget>
   <widget class="QComboBox" name="modooperacion">
@@ -234,7 +172,7 @@
     <rect>
      <x>10</x>
      <y>500</y>
-     <width>641</width>
+     <width>626</width>
      <height>21</height>
     </rect>
    </property>
@@ -244,7 +182,7 @@
     <rect>
      <x>10</x>
      <y>550</y>
-     <width>641</width>
+     <width>626</width>
      <height>21</height>
     </rect>
    </property>
@@ -706,7 +644,7 @@
       <string/>
      </property>
      <property name="pixmap">
-      <pixmap>Block_Diagram.png</pixmap>
+      <pixmap>../../OneDrive/Bureau/Nueva carpeta/UTP/Teoría control II/DCMotorRepository/MotorDCconTeensy/MotorDCSystemIdentification/Block_Diagram.png</pixmap>
      </property>
      <property name="scaledContents">
       <bool>true</bool>
@@ -1057,7 +995,7 @@
       <string/>
      </property>
      <property name="pixmap">
-      <pixmap>rlocus.png</pixmap>
+      <pixmap>../../OneDrive/Bureau/Nueva carpeta/UTP/Teoría control II/DCMotorRepository/MotorDCconTeensy/MotorDCSystemIdentification/rlocus.png</pixmap>
      </property>
      <property name="scaledContents">
       <bool>true</bool>
@@ -1615,12 +1553,12 @@
      </property>
      <item>
       <property name="text">
-       <string>Incremental PID</string>
+       <string>Positional PID</string>
       </property>
      </item>
      <item>
       <property name="text">
-       <string>Positional PID</string>
+       <string>Incremental PID</string>
       </property>
      </item>
     </widget>
@@ -2074,7 +2012,7 @@
       <string/>
      </property>
      <property name="pixmap">
-      <pixmap>rlocusz.drawio.png</pixmap>
+      <pixmap>../../OneDrive/Bureau/Nueva carpeta/UTP/Teoría control II/DCMotorRepository/MotorDCconTeensy/MotorDCSystemIdentification/rlocusz.drawio.png</pixmap>
      </property>
      <property name="scaledContents">
       <bool>true</bool>
@@ -2162,7 +2100,7 @@
       </font>
      </property>
      <property name="text">
-      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p align=&quot;center&quot;&gt;Digital controller coefficients&lt;/p&gt;&lt;p align=&quot;center&quot;&gt;x = input (error), y = ouptut (PWM)&lt;/p&gt;&lt;p align=&quot;center&quot;&gt;&lt;br/&gt;Ensure the controller transfer function is in the form:&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p align=&quot;center&quot;&gt;Digital controller coefficients&lt;/p&gt;&lt;p align=&quot;center&quot;&gt;x = input (error), y = ouptut (PWM)&lt;/p&gt;&lt;p align=&quot;center&quot;&gt;&lt;br/&gt;Make sure the controller transfer function is in the form:&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
      </property>
     </widget>
     <widget class="QLabel" name="C_label">
@@ -2362,7 +2300,7 @@
       <string/>
      </property>
      <property name="pixmap">
-      <pixmap>Implemented_H(z).png</pixmap>
+      <pixmap>../../OneDrive/Bureau/Nueva carpeta/UTP/Teoría control II/DCMotorRepository/MotorDCconTeensy/MotorDCSystemIdentification/Implemented_H(z).png</pixmap>
      </property>
      <property name="scaledContents">
       <bool>true</bool>
@@ -2501,28 +2439,56 @@ p, li { white-space: pre-wrap; }
      </property>
     </widget>
    </widget>
-  </widget>
-  <widget class="QSlider" name="slider">
-   <property name="geometry">
-    <rect>
-     <x>970</x>
-     <y>510</y>
-     <width>21</width>
-     <height>31</height>
-    </rect>
-   </property>
-   <property name="maximum">
-    <number>255</number>
-   </property>
-   <property name="orientation">
-    <enum>Qt::Vertical</enum>
-   </property>
+   <widget class="QWidget" name="tab_10">
+    <attribute name="title">
+     <string>Config</string>
+    </attribute>
+    <widget class="QLineEdit" name="deadzone">
+     <property name="geometry">
+      <rect>
+       <x>30</x>
+       <y>75</y>
+       <width>71</width>
+       <height>20</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QLabel" name="deadzone_label">
+     <property name="geometry">
+      <rect>
+       <x>30</x>
+       <y>55</y>
+       <width>81</width>
+       <height>16</height>
+      </rect>
+     </property>
+     <property name="toolTip">
+      <string>PWM values for which the motor does not respond. Can be characterized with triangular input signal.</string>
+     </property>
+     <property name="text">
+      <string>Motor Dead Zone</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="label_15">
+     <property name="geometry">
+      <rect>
+       <x>30</x>
+       <y>15</y>
+       <width>346</width>
+       <height>26</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;span style=&quot; font-size:14pt; font-weight:600;&quot;&gt;Additional configuration parameters&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+     </property>
+    </widget>
+   </widget>
   </widget>
   <widget class="QLabel" name="slider_label">
    <property name="geometry">
     <rect>
-     <x>960</x>
-     <y>540</y>
+     <x>1100</x>
+     <y>560</y>
      <width>61</width>
      <height>16</height>
     </rect>
@@ -2534,73 +2500,21 @@ p, li { white-space: pre-wrap; }
   <widget class="QPushButton" name="update_parameters">
    <property name="geometry">
     <rect>
-     <x>680</x>
-     <y>490</y>
-     <width>151</width>
-     <height>81</height>
+     <x>800</x>
+     <y>485</y>
+     <width>161</width>
+     <height>86</height>
     </rect>
    </property>
    <property name="text">
     <string>Update parameters</string>
    </property>
   </widget>
-  <widget class="QLineEdit" name="datapoints">
-   <property name="geometry">
-    <rect>
-     <x>130</x>
-     <y>420</y>
-     <width>61</width>
-     <height>20</height>
-    </rect>
-   </property>
-  </widget>
-  <widget class="QLabel" name="datapoints_label">
-   <property name="geometry">
-    <rect>
-     <x>130</x>
-     <y>390</y>
-     <width>71</width>
-     <height>31</height>
-    </rect>
-   </property>
-   <property name="toolTip">
-    <string>Number of datapoints held by the chart. Related to the displayed time in the x axis via the Time delay / Sampling time.</string>
-   </property>
-   <property name="text">
-    <string># Datapoints</string>
-   </property>
-  </widget>
-  <widget class="QLineEdit" name="deadzone">
-   <property name="geometry">
-    <rect>
-     <x>120</x>
-     <y>200</y>
-     <width>71</width>
-     <height>20</height>
-    </rect>
-   </property>
-  </widget>
-  <widget class="QLabel" name="deadzone_label">
-   <property name="geometry">
-    <rect>
-     <x>120</x>
-     <y>180</y>
-     <width>81</width>
-     <height>16</height>
-    </rect>
-   </property>
-   <property name="toolTip">
-    <string>PWM values for which the motor does not respond. Can be characterized with triangular input signal.</string>
-   </property>
-   <property name="text">
-    <string>Dead Zone</string>
-   </property>
-  </widget>
   <widget class="QFrame" name="frame">
    <property name="geometry">
     <rect>
      <x>10</x>
-     <y>270</y>
+     <y>350</y>
      <width>191</width>
      <height>121</height>
     </rect>
@@ -2748,13 +2662,13 @@ p, li { white-space: pre-wrap; }
    <property name="geometry">
     <rect>
      <x>10</x>
-     <y>250</y>
-     <width>181</width>
+     <y>330</y>
+     <width>186</width>
      <height>16</height>
     </rect>
    </property>
    <property name="text">
-    <string>Excitation signal configuration</string>
+    <string>Reference signal configuration</string>
    </property>
   </widget>
   <widget class="QLabel" name="datapoints_label_2">
@@ -2786,8 +2700,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QCheckBox" name="identdatafile">
    <property name="geometry">
     <rect>
-     <x>1030</x>
-     <y>540</y>
+     <x>1090</x>
+     <y>535</y>
      <width>91</width>
      <height>16</height>
     </rect>
@@ -2799,7 +2713,7 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="identdata">
    <property name="geometry">
     <rect>
-     <x>1000</x>
+     <x>1045</x>
      <y>490</y>
      <width>171</width>
      <height>31</height>
@@ -2812,7 +2726,7 @@ p, li { white-space: pre-wrap; }
   <widget class="QCheckBox" name="identdatagraph">
    <property name="geometry">
     <rect>
-     <x>1030</x>
+     <x>1075</x>
      <y>520</y>
      <width>111</width>
      <height>16</height>
@@ -2825,8 +2739,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLineEdit" name="tuner_tf">
    <property name="geometry">
     <rect>
-     <x>920</x>
-     <y>500</y>
+     <x>1120</x>
+     <y>505</y>
      <width>56</width>
      <height>20</height>
     </rect>
@@ -2835,8 +2749,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLineEdit" name="tuner_ts">
    <property name="geometry">
     <rect>
-     <x>920</x>
-     <y>475</y>
+     <x>1120</x>
+     <y>480</y>
      <width>56</width>
      <height>20</height>
     </rect>
@@ -2845,8 +2759,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="tuner_tf_label">
    <property name="geometry">
     <rect>
-     <x>870</x>
-     <y>505</y>
+     <x>1105</x>
+     <y>520</y>
      <width>35</width>
      <height>10</height>
     </rect>
@@ -2858,8 +2772,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="tuner_ts_label">
    <property name="geometry">
     <rect>
-     <x>870</x>
-     <y>480</y>
+     <x>1105</x>
+     <y>495</y>
      <width>35</width>
      <height>10</height>
     </rect>
@@ -2871,8 +2785,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QWidget" name="verticalLayoutWidget_9">
    <property name="geometry">
     <rect>
-     <x>1105</x>
-     <y>525</y>
+     <x>1140</x>
+     <y>500</y>
      <width>56</width>
      <height>41</height>
     </rect>
@@ -2886,8 +2800,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="tuner_loaded_plant_label">
    <property name="geometry">
     <rect>
-     <x>1000</x>
-     <y>480</y>
+     <x>1100</x>
+     <y>490</y>
      <width>51</width>
      <height>21</height>
     </rect>
@@ -2905,7 +2819,7 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="tuner_status">
    <property name="geometry">
     <rect>
-     <x>1030</x>
+     <x>1075</x>
      <y>470</y>
      <width>76</width>
      <height>31</height>
@@ -2918,8 +2832,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLineEdit" name="tuner_output_max">
    <property name="geometry">
     <rect>
-     <x>860</x>
-     <y>560</y>
+     <x>1140</x>
+     <y>555</y>
      <width>56</width>
      <height>20</height>
     </rect>
@@ -2931,8 +2845,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLineEdit" name="tuner_output_min">
    <property name="geometry">
     <rect>
-     <x>870</x>
-     <y>555</y>
+     <x>1150</x>
+     <y>550</y>
      <width>56</width>
      <height>20</height>
     </rect>
@@ -2944,8 +2858,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="tuner_output_min_label">
    <property name="geometry">
     <rect>
-     <x>855</x>
-     <y>540</y>
+     <x>1105</x>
+     <y>550</y>
      <width>35</width>
      <height>10</height>
     </rect>
@@ -2957,8 +2871,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="tuner_output_max_label">
    <property name="geometry">
     <rect>
-     <x>860</x>
-     <y>530</y>
+     <x>1110</x>
+     <y>540</y>
      <width>35</width>
      <height>10</height>
     </rect>
@@ -2970,8 +2884,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QCheckBox" name="tuner_use_aw">
    <property name="geometry">
     <rect>
-     <x>890</x>
-     <y>500</y>
+     <x>1090</x>
+     <y>505</y>
      <width>111</width>
      <height>21</height>
     </rect>
@@ -2983,8 +2897,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLineEdit" name="tuner_aw_time">
    <property name="geometry">
     <rect>
-     <x>985</x>
-     <y>500</y>
+     <x>1095</x>
+     <y>510</y>
      <width>56</width>
      <height>20</height>
     </rect>
@@ -2993,8 +2907,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="tuner_aw_label">
    <property name="geometry">
     <rect>
-     <x>965</x>
-     <y>505</y>
+     <x>1165</x>
+     <y>510</y>
      <width>35</width>
      <height>10</height>
     </rect>
@@ -3002,6 +2916,147 @@ p, li { white-space: pre-wrap; }
    <property name="text">
     <string>Reset time</string>
    </property>
+  </widget>
+  <widget class="QSlider" name="slider">
+   <property name="geometry">
+    <rect>
+     <x>85</x>
+     <y>295</y>
+     <width>96</width>
+     <height>21</height>
+    </rect>
+   </property>
+   <property name="maximum">
+    <number>350</number>
+   </property>
+   <property name="singleStep">
+    <number>10</number>
+   </property>
+   <property name="pageStep">
+    <number>30</number>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Horizontal</enum>
+   </property>
+  </widget>
+  <widget class="QLabel" name="label_16">
+   <property name="geometry">
+    <rect>
+     <x>1080</x>
+     <y>40</y>
+     <width>101</width>
+     <height>26</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>Switch tabs here</string>
+   </property>
+  </widget>
+  <widget class="QLineEdit" name="datapoints">
+   <property name="geometry">
+    <rect>
+     <x>120</x>
+     <y>150</y>
+     <width>51</width>
+     <height>20</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string/>
+   </property>
+  </widget>
+  <widget class="QSplitter" name="splitter">
+   <property name="geometry">
+    <rect>
+     <x>10</x>
+     <y>125</y>
+     <width>181</width>
+     <height>16</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Horizontal</enum>
+   </property>
+   <widget class="QLabel" name="delay_label">
+    <property name="toolTip">
+     <string>Time delay between loops. Sampling time for discrete systems.</string>
+    </property>
+    <property name="text">
+     <string>Sampling time (ms)</string>
+    </property>
+   </widget>
+   <widget class="QLabel" name="datapoints_label">
+    <property name="toolTip">
+     <string>Number of datapoints held by the chart. Related to the displayed time in the x axis via the Time delay / Sampling time.</string>
+    </property>
+    <property name="text">
+     <string># Datapoints</string>
+    </property>
+   </widget>
+  </widget>
+  <widget class="QSplitter" name="splitter_2">
+   <property name="geometry">
+    <rect>
+     <x>10</x>
+     <y>180</y>
+     <width>161</width>
+     <height>71</height>
+    </rect>
+   </property>
+   <property name="orientation">
+    <enum>Qt::Vertical</enum>
+   </property>
+   <widget class="QCheckBox" name="saveValuesCheckBox">
+    <property name="enabled">
+     <bool>true</bool>
+    </property>
+    <property name="sizeIncrement">
+     <size>
+      <width>10</width>
+      <height>10</height>
+     </size>
+    </property>
+    <property name="baseSize">
+     <size>
+      <width>5</width>
+      <height>5</height>
+     </size>
+    </property>
+    <property name="font">
+     <font>
+      <pointsize>10</pointsize>
+     </font>
+    </property>
+    <property name="text">
+     <string>Save values to CSV file?</string>
+    </property>
+   </widget>
+   <widget class="QCheckBox" name="manualinput">
+    <property name="enabled">
+     <bool>true</bool>
+    </property>
+    <property name="font">
+     <font>
+      <pointsize>10</pointsize>
+     </font>
+    </property>
+    <property name="text">
+     <string>Manual reference signal</string>
+    </property>
+   </widget>
+   <widget class="QCheckBox" name="automaticinput">
+    <property name="enabled">
+     <bool>true</bool>
+    </property>
+    <property name="font">
+     <font>
+      <pointsize>10</pointsize>
+     </font>
+    </property>
+    <property name="text">
+     <string>Automatic reference signal</string>
+    </property>
+   </widget>
   </widget>
  </widget>
  <resources/>

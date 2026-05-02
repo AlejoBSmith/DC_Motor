@@ -112,21 +112,29 @@ EncoderData enc;
 SerialData serialData;
 MeasurementsData meas;
 
+constexpr int COMMAND_FIELD_COUNT = 25;
 int avgwindowsize = 1;
 int currentwindowsize = 4; //la medición de corriente es particularmente ruidosa
 MovingAvgF RPMAvg(avgwindowsize);
-MovingMedianF FilteredCurrentMedian(avgwindowsize); //Moving median
+MovingMedianF FilteredCurrentMedian(currentwindowsize); //Moving median
 MovingAvgF FilteredCurrent(currentwindowsize);  // 1st order avg filter
 MovingAvgF FilteredCurrent2(currentwindowsize); // 2nd order avg filter
 
-void divideString(String DatoSerial, char delimitador, String salida[], int limite) {
+int divideString(String DatoSerial, char delimitador, String salida[], int limite) {
   int posicion = 0;
   int indice = 0;
   while ((posicion = DatoSerial.indexOf(delimitador)) != -1 && indice < limite - 1) {
-    salida[indice++] = DatoSerial.substring(0, posicion);
+    salida[indice] = DatoSerial.substring(0, posicion);
+    salida[indice].trim();
+    indice++;
     DatoSerial = DatoSerial.substring(posicion + 1);
   }
-  salida[indice] = DatoSerial;
+  if (indice < limite) {
+    salida[indice] = DatoSerial;
+    salida[indice].trim();
+    indice++;
+  }
+  return indice;
 }
 
 void resetControllerMemory() {
@@ -158,6 +166,7 @@ void inicializaVariables() {
   resetControllerMemory();
 
   RPMAvg.reset();
+  FilteredCurrentMedian.reset();
   FilteredCurrent.reset();
   FilteredCurrent2.reset();
 }
@@ -175,6 +184,21 @@ void updateEncoder() {
   if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000)
     enc.encoderTicks--;
   enc.lastEncoded = encoded;
+}
+
+int32_t consumeEncoderTicks() {
+  noInterrupts();
+  int32_t ticks = enc.encoderTicks;
+  enc.encoderTicks = 0;
+  interrupts();
+  return ticks;
+}
+
+int32_t readEncoderTicks() {
+  noInterrupts();
+  int32_t ticks = enc.encoderTicks;
+  interrupts();
+  return ticks;
 }
 
 float PRBS() {
@@ -255,6 +279,11 @@ int GeneradorReferencia(int tiposenal) {
   return 0;
 }
 
+int ActualizarReferencia() {
+  sys.referencia = sys.tiporef ? GeneradorReferencia(sys.tiposenal) : sys.referenciaManual;
+  return sys.referencia;
+}
+
 inline void PID_update_coeficientes(float Ts) {
   static float Ts_prev = -1.f, Kd_prev = -1.f, Tc_prev = -1.f;
   const float Tc = fmaxf(ctrl.time_constant, 1e-6f);
@@ -304,7 +333,7 @@ int PID_positional_Tustin() {
   ctrl.controladorOUT = u_sat;
   ctrl.previousError  = e;
 
-  return (int)(u_sat + 0.5f);
+  return (int)lroundf(u_sat);
 }
 
 int PID_incremental() {
@@ -336,7 +365,7 @@ int PID_incremental() {
   ctrl.controladorOUT = u_sat;
   ctrl.previousOutput = u_sat;
   ctrl.previousError  = ctrl.error;
-  return (int)(u_sat + 0.5f);
+  return (int)lroundf(u_sat);
 }
 
 int EcuacionDiferencias() { //Aquí, X es la entrada (error) y Y es la salida (PWM Arduino)
@@ -355,7 +384,7 @@ int EcuacionDiferencias() { //Aquí, X es la entrada (error) y Y es la salida (P
     ctrl.controladorOUT = constrain(ctrl.controladorOUT, 0, 255);
   if (sys.modooperacion == 3)
     ctrl.controladorOUT = constrain(ctrl.controladorOUT, -255, 255);
-  return ctrl.controladorOUT;
+  return (int)lroundf(ctrl.controladorOUT);
 }
 
 void setup() {
@@ -371,6 +400,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(pins.encoderB), updateEncoder, CHANGE);
   Serial.begin(115200);
   RPMAvg.begin();
+  FilteredCurrentMedian.begin();
   FilteredCurrent.begin();
   FilteredCurrent2.begin();
   randomSeed(analogRead(2));
@@ -379,36 +409,50 @@ void setup() {
 void loop() {
   if (Serial.available() > 0) {
     serialData.DatoSerial = Serial.readStringUntil('\n');
-    String parts[60];
-    divideString(serialData.DatoSerial, ',', parts, 60);
-    sys.inicio              = parts[0].toInt();
-    sys.modooperacion       = parts[1].toInt();
-    ctrl.A_cont             = parts[2].toFloat();
-    ctrl.B_cont             = parts[3].toFloat();
-    ctrl.C_cont             = parts[4].toFloat();
-    ctrl.D_cont             = parts[5].toFloat();
-    ctrl.E_cont             = parts[6].toFloat();
-    ctrl.F_cont             = parts[7].toFloat();
-    ctrl.G_cont             = parts[8].toFloat();
-    ctrl.H_cont             = parts[9].toFloat();
-    timing.delayintencional = parts[10].toInt();
-    timing.tiemporeferencia = parts[11].toInt();
-    sys.amplitudAuto        = parts[12].toInt();
-    sys.referenciaManual    = parts[13].toInt();
-    sys.offset              = parts[14].toInt();
-    sys.tiposenal           = parts[15].toInt();
-    sys.tab_activo          = parts[16].toInt();
-    ctrl.Kp                 = parts[17].toFloat();
-    ctrl.Ki                 = parts[18].toFloat();
-    ctrl.Kd                 = parts[19].toFloat();
-    ctrl.ZM                 = parts[20].toInt();
-    ctrl.time_constant      = parts[21].toFloat();
-    ctrl.PIDtype            = parts[22].toInt();
-    sys.tiporef             = parts[23].toInt();
-    ctrl.reset_time         = parts[24].toFloat();
-    if (timing.delayintencional <= 1) timing.delayintencional = 1;
-    inicializaVariables();
-    timing.tiemporestart = micros() / 1000.0f;
+    serialData.DatoSerial.trim();
+
+    String parts[COMMAND_FIELD_COUNT];
+    int fieldCount = divideString(serialData.DatoSerial, ',', parts, COMMAND_FIELD_COUNT);
+    if (fieldCount == COMMAND_FIELD_COUNT) {
+      sys.inicio              = parts[0].toInt();
+      sys.modooperacion       = parts[1].toInt();
+      ctrl.A_cont             = parts[2].toFloat();
+      ctrl.B_cont             = parts[3].toFloat();
+      ctrl.C_cont             = parts[4].toFloat();
+      ctrl.D_cont             = parts[5].toFloat();
+      ctrl.E_cont             = parts[6].toFloat();
+      ctrl.F_cont             = parts[7].toFloat();
+      ctrl.G_cont             = parts[8].toFloat();
+      ctrl.H_cont             = parts[9].toFloat();
+      timing.delayintencional = parts[10].toInt();
+
+      long referencePeriod = parts[11].toInt();
+      timing.tiemporeferencia = (referencePeriod > 0) ? (unsigned long)referencePeriod : 1UL;
+
+      sys.amplitudAuto        = parts[12].toInt();
+      sys.referenciaManual    = parts[13].toInt();
+      sys.offset              = parts[14].toInt();
+      sys.tiposenal           = parts[15].toInt();
+      sys.tab_activo          = parts[16].toInt();
+      ctrl.Kp                 = parts[17].toFloat();
+      ctrl.Ki                 = parts[18].toFloat();
+      ctrl.Kd                 = parts[19].toFloat();
+      ctrl.ZM                 = parts[20].toInt();
+      ctrl.time_constant      = parts[21].toFloat();
+      ctrl.PIDtype            = parts[22].toInt();
+      sys.tiporef             = parts[23].toInt();
+      ctrl.reset_time         = parts[24].toFloat();
+
+      if (timing.delayintencional < 1) timing.delayintencional = 1;
+      if (ctrl.time_constant < 1e-6f) ctrl.time_constant = 1e-6f;
+      if (ctrl.reset_time < 1e-6f) ctrl.reset_time = 1e-6f;
+      ctrl.PIDtype = constrain(ctrl.PIDtype, 0, 1);
+      ctrl.ZM = constrain(ctrl.ZM, 0, 255);
+      sys.tiporef = sys.tiporef ? 1 : 0;
+
+      inicializaVariables();
+      timing.tiemporestart = micros() / 1000UL;
+    }
   }
 
   timing.tiempoanterior      = timing.tiempo;
@@ -426,25 +470,23 @@ void loop() {
           break;
 
         case 1: { // System Identification
-          sys.referencia      = GeneradorReferencia(sys.tiposenal);
+          sys.referencia      = ActualizarReferencia();
           ctrl.controladorOUT = sys.referencia;
           ctrl.controladorOUT = constrain(ctrl.controladorOUT, 0, 255);
           if (timing.tiempociclo < 1) timing.tiempociclo = timing.delayintencional;
-          meas.RPM         = enc.encoderTicks / (float)timing.tiempociclo * 60.0f * 1000.0f / (4.0f * ctrl.PPR);
+          meas.RPM         = consumeEncoderTicks() / (float)timing.tiempociclo * 60.0f * 1000.0f / (4.0f * ctrl.PPR);
           meas.RPMPromedio = RPMAvg.reading(meas.RPM);
-          enc.encoderTicks = 0;
-          ctrl.PWMOUT = ctrl.controladorOUT;
+          ctrl.PWMOUT = (int)lroundf(ctrl.controladorOUT);
           analogWrite(pins.pwmPin, ctrl.PWMOUT);
           sys.medicion = meas.RPMPromedio;
           break;
         }
 
         case 2: { // Control Velocidad
-          sys.referencia = GeneradorReferencia(sys.tiposenal);
+          sys.referencia = ActualizarReferencia();
           if (timing.tiempociclo < 1) timing.tiempociclo = timing.delayintencional;
-          meas.RPM         = enc.encoderTicks / (float)timing.tiempociclo * 60.0f * 1000.0f / (4.0f * ctrl.PPR);
+          meas.RPM         = consumeEncoderTicks() / (float)timing.tiempociclo * 60.0f * 1000.0f / (4.0f * ctrl.PPR);
           meas.RPMPromedio = RPMAvg.reading(meas.RPM);
-          enc.encoderTicks = 0;
 
           ctrl.error = sys.referencia - meas.RPMPromedio;
 
@@ -452,6 +494,7 @@ void loop() {
             switch (ctrl.PIDtype) {
               case 0:  ctrl.controladorOUT = PID_incremental();       break;
               case 1:  ctrl.controladorOUT = PID_positional_Tustin(); break;
+              default: ctrl.controladorOUT = 0; break;
             }
             if (sys.referencia != 0){
               ctrl.PWMOUT = ctrl.controladorOUT + ctrl.ZM; // zona muerta solo si ref ≠ 0
@@ -468,6 +511,8 @@ void loop() {
             } else {
               resetControllerMemory();
             }
+          } else {
+            resetControllerMemory();
           }
           analogWrite(pins.pwmPin, ctrl.PWMOUT);
           sys.medicion = meas.RPMPromedio;
@@ -475,8 +520,8 @@ void loop() {
         }
 
         case 3: { // Control Posición
-          sys.referencia = GeneradorReferencia(sys.tiposenal);
-          sys.deg        = enc.encoderTicks * (360.0f / (4.0f * ctrl.PPR));
+          sys.referencia = ActualizarReferencia();
+          sys.deg        = readEncoderTicks() * (360.0f / (4.0f * ctrl.PPR));
           ctrl.error     = sys.referencia - sys.deg;
           if (timing.tiempociclo < 1) timing.tiempociclo = timing.delayintencional;
 
@@ -485,6 +530,7 @@ void loop() {
             switch (ctrl.PIDtype) {
               case 0: u = PID_incremental();       break;
               case 1: u = PID_positional_Tustin(); break;
+              default: u = 0; break;
             }
           } else if (sys.tab_activo == 8) {
             u = EcuacionDiferencias();
