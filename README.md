@@ -42,10 +42,6 @@ This repository contains the source code and graphical user interface (GUI) for 
   Interface design file created with Qt Designer.
 
 ### Other Files
-- **`Ejemplos/DatosMotorDC.mat`**  
-  Example file with DC motor data for testing and validation.
-- **`EasyEDA/`**  
-  PCB and schematic design files in EasyEDA format.
 - **`include/` and `lib/`**  
   Auxiliary libraries and headers for the firmware.
 - **`test/`**  
@@ -95,13 +91,12 @@ This repository contains the source code and graphical user interface (GUI) for 
 
 ## Usage
 
-1. **Hardware setup**: Connect the DC motor, driver, and encoder according to the schematic in `EasyEDA/`.
+1. **Hardware setup**: Connect the DC motor, driver, and encoder.
 2. **Upload firmware**: Flash the code to the Teensy using PlatformIO.
 3. **Run the GUI**: Launch the application and connect to the Teensy's serial port.
 4. **Configure parameters**: Adjust PID parameters or input z-domain coefficients.
 5. **Run tests**: Generate excitation signals, monitor responses, and log data.
 
-For usage examples, refer to the data in `Ejemplos/DatosMotorDC.mat`.
 
 ## Contributing
 
