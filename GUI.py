@@ -1,28 +1,38 @@
 import sys
 import os
+import warnings
 import pyqtgraph as pg
 import serial
 import serial.tools.list_ports
 import numpy as np
-import pandas as pd
 import control as ctrl
 from datetime import datetime
 from collections import deque
-from PyQt6.QtCore import Qt
-from PyQt6 import QtCore
-from PyQt6 import QtWidgets, uic
-from PyQt6.QtWidgets import QDialogButtonBox, QButtonGroup, QMessageBox, QDialog, QLabel, QComboBox, QPushButton, QHBoxLayout, QVBoxLayout
-from PyQt6.QtCore import QTimer
+from time import monotonic
+from PyQt6 import QtCore, QtWidgets, uic
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import (
+    QButtonGroup,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 from scipy.optimize import curve_fit, minimize
 from scipy.signal import cont2discrete
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QDialog, QHBoxLayout, QVBoxLayout, QTextEdit, QWidget, QFormLayout, QGroupBox, QSizePolicy, QFrame
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
 
 KNOWN_VIDPID = {
     (0x16C0, 0x0483),  # Teensy 4.x USB-Serial (PJRC)
@@ -41,6 +51,15 @@ def auto_find_port():
         if any(k in (p.description or "") for k in PREF_DESCR):
             return p.device
     return None
+
+def plot_root_locus_clean(sys, ax):
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="axis already exists; grid keyword ignored",
+            category=UserWarning,
+        )
+        return ctrl.root_locus_plot(sys, ax=ax, grid=False, interactive=False)
 
 class ControlPlotDialog(QDialog):
     """
@@ -131,6 +150,7 @@ class ControlPlotDialog(QDialog):
         comp_group_layout.setContentsMargins(8, 8, 8, 8)
 
         form = QFormLayout()
+        self.comp_form = form
         form.addRow("Element", self.comp_type)
         form.addRow("Location", self.comp_value)
         form.addRow("Imag", self.comp_imag)
@@ -206,7 +226,7 @@ class ControlPlotDialog(QDialog):
         self.comp_value.setVisible(need_location)
         self.comp_imag.setVisible(need_imag)
 
-        form = self.comp_value.parentWidget().layout()
+        form = getattr(self, "comp_form", None)
         if form is not None:
             try:
                 form.labelForField(self.comp_value).setVisible(need_location)
@@ -388,9 +408,9 @@ class ControlPlotDialog(QDialog):
 
         rldata = ctrl.root_locus_map(self.sys)
         self._rlist = np.asarray(rldata.loci)
-        self._klist = np.asarray(rdata.gains) if False else np.asarray(rldata.gains)
+        self._klist = np.asarray(rldata.gains)
 
-        ctrl.root_locus_plot(self.sys, ax=self.ax_rl, grid=False)
+        plot_root_locus_clean(self.sys, self.ax_rl)
 
         xleft, _ = self.ax_rl.get_xlim()
         self.ax_rl.set_xlim(xleft, 0.0)
@@ -540,7 +560,7 @@ class ControlPlotDialog(QDialog):
             f"C(s):\n{Ctxt}\n\n"
             f"Closed-loop step_info(T):\n{step_txt}\n\n"
             f"Closed-loop bandwidth(T) (-3 dB): {bw_txt}\n\n"
-            f"Open-loop margins (L = K·C·G):\n{margin_txt}"
+            f"Open-loop margins (L = K*C*G):\n{margin_txt}"
         )
 
 class DiscreteControlPlotDialog(QDialog):
@@ -682,6 +702,7 @@ class DiscreteControlPlotDialog(QDialog):
         comp_group_layout.setContentsMargins(8, 8, 8, 8)
 
         form = QFormLayout()
+        self.comp_form = form
         form.addRow("Element", self.comp_type)
         form.addRow("Location", self.comp_value)
         form.addRow("Imag", self.comp_imag)
@@ -782,7 +803,7 @@ class DiscreteControlPlotDialog(QDialog):
         self.comp_value.setVisible(need_location)
         self.comp_imag.setVisible(need_imag)
 
-        form = self.comp_value.parentWidget().layout()
+        form = getattr(self, "comp_form", None)
         if form is not None:
             try:
                 form.labelForField(self.comp_value).setVisible(need_location)
@@ -988,14 +1009,23 @@ class DiscreteControlPlotDialog(QDialog):
     def _draw_root_locus(self, selected_poles=None):
         self.ax_rl.clear()
 
-        ctrl.root_locus_plot(self.sys, ax=self.ax_rl, grid=False)
+        plot_root_locus_clean(self.sys, self.ax_rl)
 
-        self.ax_rl.set_xlim(-1.1, 1.1)
-        self.ax_rl.set_ylim(-1.1, 1.1)
-        self.ax_rl.set_aspect('equal', adjustable='box')
+        parent = self.parent()
+        if hasattr(parent, "_set_zplane_limits"):
+            points = []
+            points.append(selected_poles)
+            try:
+                points.append(ctrl.poles(self.sys))
+                points.append(ctrl.zeros(self.sys))
+            except Exception:
+                pass
+            parent._set_zplane_limits(self.ax_rl, points)
+        else:
+            self.ax_rl.set_aspect('equal', adjustable='box')
 
-        if hasattr(self.parent(), "_overlay_zgrid"):
-            self.parent()._overlay_zgrid(self.ax_rl, show_labels=True)
+        if hasattr(parent, "_overlay_zgrid"):
+            parent._overlay_zgrid(self.ax_rl, show_labels=True, Ts=self.Ts)
 
         self.ax_rl.set_title("")
         self.ax_rl.set_xlabel("")
@@ -1295,7 +1325,7 @@ class DiscreteControlPlotDialog(QDialog):
             f"|z| = {pole_mag}\n"
             f"Inside unit circle: {stable_txt}\n"
             f"Ts = {self.Ts} s\n\n"
-            f"Controller to implement K·C(z) in z^-1 form:\n"
+            f"Controller to implement K*C(z) in z^-1 form:\n"
             f"{implemented_txt}\n\n"
             f"Closed-loop step_info(T):\n{step_txt}"
         )
@@ -1741,9 +1771,15 @@ class MyDialog(QtWidgets.QDialog):
         else:
             self.setWindowTitle(f"{base_title} — no port")
         self.serial_port = None
+        self.serial_port_name = port
+        self.controller_connected = False
+        self._last_reconnect_attempt = 0.0
+        self._reconnect_interval_s = 1.0
+        self._serial_status_message = ""
         if port:
             try:
-                self.serial_port = serial.Serial(port, 115200, timeout=1)
+                self.serial_port = serial.Serial(port, 115200, timeout=0.05, write_timeout=0.05)
+                self.controller_connected = True
             except Exception as e:
                 QMessageBox.critical(self, "Serial error",
                                      f"Could not open port {port}:\n{e}")
@@ -1914,7 +1950,6 @@ class MyDialog(QtWidgets.QDialog):
 
         self.graphWidgetRPM = pg.PlotWidget()
 
-        self.legendRPM  = self.graphWidgetRPM.addLegend()
         pi = self.graphWidgetRPM.getPlotItem()
         self.legendRPM = pi.addLegend()
         self.legendRPM.setParentItem(pi.vb)
@@ -1927,7 +1962,6 @@ class MyDialog(QtWidgets.QDialog):
         self.RPM.deleteLater()
 
         self.graphWidgetPWM = pg.PlotWidget()
-        self.legendPWM  = self.graphWidgetPWM.addLegend()
         piSETPOINT = self.graphWidgetPWM.getPlotItem()
         self.legendPWM = piSETPOINT.addLegend()
         self.legendPWM.setParentItem(piSETPOINT.vb)
@@ -2006,6 +2040,58 @@ class MyDialog(QtWidgets.QDialog):
         self.timer.start()
         self.timerHora.start()
 
+    def _show_controller_disconnected(self, reason=None):
+        if self.serial_port is not None:
+            try:
+                self.serial_port.close()
+            except Exception:
+                pass
+        self.serial_port = None
+        self.controller_connected = False
+        self._serial_status_message = "Controlador desconectado, esperando reconexión"
+        self.textBrowser.setText(self._serial_status_message)
+        if reason:
+            print(f"Serial disconnected: {reason}")
+
+    def _show_controller_connected(self):
+        was_disconnected = not self.controller_connected
+        self.controller_connected = True
+        self._serial_status_message = ""
+        self.textBrowser.setText("")
+        if was_disconnected:
+            self.toggleupdate_parameters()
+
+    def _try_reconnect_serial(self):
+        now = monotonic()
+        if now - self._last_reconnect_attempt < self._reconnect_interval_s:
+            return False
+        self._last_reconnect_attempt = now
+
+        ports_to_try = []
+        if self.serial_port_name:
+            ports_to_try.append(self.serial_port_name)
+        detected_port = auto_find_port()
+        if detected_port and detected_port not in ports_to_try:
+            ports_to_try.append(detected_port)
+
+        if not ports_to_try:
+            self.textBrowser.setText("Controlador desconectado, esperando reconexión")
+            return False
+
+        for port in ports_to_try:
+            try:
+                self.serial_port = serial.Serial(port, 115200, timeout=0.05, write_timeout=0.05)
+                self.serial_port_name = port
+                self.serial_port.reset_input_buffer()
+                self.setWindowTitle(f"Motor DC Control - By A Von Chong — {port}")
+                self._show_controller_connected()
+                return True
+            except Exception:
+                self.serial_port = None
+
+        self.textBrowser.setText("Controlador desconectado, esperando reconexión")
+        return False
+
     def Simulate(self):
         try:
             # Get the numerator and denominator coefficients from UI
@@ -2022,9 +2108,13 @@ class MyDialog(QtWidgets.QDialog):
                 float(self.sim_den0.text() or 0),
             ]
 
-            # Remove leading zeros to prevent errors
-            num = [coef for coef in num if coef != 0] or [0]
-            den = [coef for coef in den if coef != 0] or [1]
+            # Remove only leading zeros; zeros inside the polynomial are meaningful.
+            num = self._strip_leading_zeros(num)
+            den = self._strip_leading_zeros(den)
+
+            if all(abs(x) < 1e-12 for x in den):
+                self.textBrowser.setText("Simulation denominator is all zeros.")
+                return
 
             # Create the transfer function
             sys_tf = ctrl.TransferFunction(num, den)
@@ -2245,6 +2335,8 @@ class MyDialog(QtWidgets.QDialog):
         num = self._strip_leading_zeros(num)
         den = self._strip_leading_zeros(den)
 
+        if all(abs(x) < 1e-12 for x in num):
+            raise ValueError("Discrete RL numerator is all zeros.")
         if all(abs(x) < 1e-12 for x in den):
             raise ValueError("Discrete RL denominator is all zeros.")
 
@@ -2300,23 +2392,32 @@ class MyDialog(QtWidgets.QDialog):
 
     def update_discrete_rlocus_plots(self):
         try:
-            # If user hasn't entered a denominator yet, just show blank axes quietly
+            # If user hasn't entered a valid plant yet, just show blank axes quietly
+            num_test = [
+                self._read_float(self.rlocusz_num3),
+                self._read_float(self.rlocusz_num2),
+                self._read_float(self.rlocusz_num1),
+                self._read_float(self.rlocusz_num0),
+            ]
             den_test = [
                 self._read_float(self.rlocusz_den3),
                 self._read_float(self.rlocusz_den2),
                 self._read_float(self.rlocusz_den1),
                 self._read_float(self.rlocusz_den0),
             ]
+            num_test = self._strip_leading_zeros(num_test)
             den_test = self._strip_leading_zeros(den_test)
 
-            if all(abs(x) < 1e-12 for x in den_test):
+            if all(abs(x) < 1e-12 for x in den_test) or all(abs(x) < 1e-12 for x in num_test):
                 self.ax_zrl.clear()
                 self.ax_zstep.clear()
 
-                self.ax_zrl.set_xlim(-1.1, 1.1)
-                self.ax_zrl.set_ylim(-1.1, 1.1)
-                self.ax_zrl.set_aspect('equal', adjustable='box')
-                self._overlay_zgrid(self.ax_zrl, show_labels=False)
+                try:
+                    Ts_grid = float(self.lqr_sampling.text())
+                except Exception:
+                    Ts_grid = None
+                self._set_zplane_limits(self.ax_zrl)
+                self._overlay_zgrid(self.ax_zrl, show_labels=False, Ts=Ts_grid)
 
                 self.ax_zstep.grid(True)
 
@@ -2330,11 +2431,15 @@ class MyDialog(QtWidgets.QDialog):
             self.ax_zstep.clear()
 
             # Root locus in z-plane
-            ctrl.root_locus_plot(sysz, ax=self.ax_zrl, grid=False)
-            self.ax_zrl.set_xlim(-1.1, 1.1)
-            self.ax_zrl.set_ylim(-1.1, 1.1)
-            self.ax_zrl.set_aspect('equal', adjustable='box')
-            self._overlay_zgrid(self.ax_zrl, show_labels=False)
+            plot_root_locus_clean(sysz, self.ax_zrl)
+            self._set_zplane_limits(
+                self.ax_zrl,
+                [
+                    ctrl.poles(sysz),
+                    ctrl.zeros(sysz),
+                ]
+            )
+            self._overlay_zgrid(self.ax_zrl, show_labels=False, Ts=float(sysz.dt))
             self._strip_titles_labels(self.ax_zrl, keep_x=False, keep_y=False)
 
             # Step response with refined x-axis
@@ -2369,10 +2474,12 @@ class MyDialog(QtWidgets.QDialog):
             # Quiet on purpose; avoid spamming console while user is typing
             self.ax_zrl.clear()
             self.ax_zstep.clear()
-            self.ax_zrl.set_xlim(-1.1, 1.1)
-            self.ax_zrl.set_ylim(-1.1, 1.1)
-            self.ax_zrl.set_aspect('equal', adjustable='box')
-            self._overlay_zgrid(self.ax_zrl, show_labels=False)
+            try:
+                Ts_grid = float(self.lqr_sampling.text())
+            except Exception:
+                Ts_grid = None
+            self._set_zplane_limits(self.ax_zrl)
+            self._overlay_zgrid(self.ax_zrl, show_labels=False, Ts=Ts_grid)
             self.ax_zstep.grid(True)
             self.canvas_zrl.draw_idle()
             self.canvas_zstep.draw_idle()
@@ -2387,10 +2494,14 @@ class MyDialog(QtWidgets.QDialog):
         self.open_big_zrlocus_from_tab()
 
     def open_big_zrlocus_from_tab(self):
-        sysz = self._read_tf_from_zrlocus_inputs()
-        Ts = float(self.lqr_sampling.text())
-        dlg = DiscreteControlPlotDialog(self, sysz, Ts)
-        dlg.exec()
+        try:
+            sysz = self._read_tf_from_zrlocus_inputs()
+            Ts = float(self.lqr_sampling.text())
+            dlg = DiscreteControlPlotDialog(self, sysz, Ts)
+            dlg.exec()
+        except Exception as e:
+            if hasattr(self, "plot_error"):
+                self.plot_error.setText(f"Discrete RL error: {e}")
 
     def _sync_sampling_lineedits(self):
         def copy_a_to_b():
@@ -2436,6 +2547,7 @@ class MyDialog(QtWidgets.QDialog):
         self.tuner_speed_slider.valueChanged.connect(_schedule)
         self.tuner_damping_slider.valueChanged.connect(_schedule)
         self.tuner_controller_type.currentIndexChanged.connect(_schedule)
+        self.time_constant.textChanged.connect(_schedule)
 
         self.tuner_load_identified_btn.clicked.connect(self._load_tuner_plant)
 
@@ -2559,12 +2671,19 @@ class MyDialog(QtWidgets.QDialog):
         tau = 1.0 / slowest
         return max(1e-3, tau)
 
+    def _pid_tuner_derivative_filter_time(self):
+        try:
+            Tf = float(self.time_constant.text())
+        except Exception:
+            Tf = 0.008
+        return max(Tf, 1e-6)
+
     def _make_parallel_pid(self, ctype, kp, ki, kd):
         s = ctrl.TransferFunction.s
         ctype = ctype.upper()
 
-        # Internal derivative filter for tuner simulation only
-        Tf = 0.008
+        # Match the derivative filter used by the firmware PID implementation.
+        Tf = self._pid_tuner_derivative_filter_time()
 
         if ctype == "P":
             C = ctrl.TransferFunction([kp], [1])
@@ -2588,6 +2707,13 @@ class MyDialog(QtWidgets.QDialog):
         return ctrl.minreal(C, verbose=False)
     
     def _update_pid_tuner(self):
+        if self.tuner_loaded_plant is None:
+            self.tuner_kp.setText("")
+            self.tuner_ki.setText("")
+            self.tuner_kd.setText("")
+            self._clear_pid_tuner_plots()
+            return
+
         try:
             G = self._get_tuner_plant()
             ctype = self.tuner_controller_type.currentText().strip().upper()
@@ -2631,7 +2757,8 @@ class MyDialog(QtWidgets.QDialog):
             self.tuner_ki.setText("")
             self.tuner_kd.setText("")
             self._clear_pid_tuner_plots()
-            print(f"PID tuner error: {e}")
+            if hasattr(self, "tuner_status"):
+                self.tuner_status.setText(f"PID tuner error: {e}")
 
     def _initial_guess_from_plant(self, G, ctype):
         try:
@@ -2863,73 +2990,48 @@ class MyDialog(QtWidgets.QDialog):
             self.equivalent_tf.setText(f"Error reducing block diagram: {e}")
 
     def tf_to_pretty_str(self, sys, var='s', digits=6, eps=1e-12):
-                """Return only the transfer function fraction (no sys[..], no I/O labels)."""
-                # SISO assumed
-                num = np.asarray(sys.num[0][0], dtype=float)
-                den = np.asarray(sys.den[0][0], dtype=float)
+        """Return only the transfer function fraction (no sys[..], no I/O labels)."""
+        num = np.asarray(sys.num[0][0], dtype=float)
+        den = np.asarray(sys.den[0][0], dtype=float)
 
-                # trim tiny coeffs
-                num[np.abs(num) < eps] = 0.0
-                den[np.abs(den) < eps] = 0.0
+        num[np.abs(num) < eps] = 0.0
+        den[np.abs(den) < eps] = 0.0
 
-                def poly_str(c):
-                    # c is descending powers
-                    n = len(c) - 1
-                    terms = []
-                    for i, a in enumerate(c):
-                        p = n - i
-                        if abs(a) < eps:
-                            continue
-                        a_str = f"{a:.{digits}g}"
+        def poly_str(c):
+            n = len(c) - 1
+            terms = []
+            for i, a in enumerate(c):
+                p = n - i
+                if abs(a) < eps:
+                    continue
+                a_str = f"{a:.{digits}g}"
 
-                        if p == 0:
-                            terms.append(f"{a_str}")
-                        elif p == 1:
-                            if abs(a - 1.0) < eps:   terms.append(f"{var}")
-                            elif abs(a + 1.0) < eps: terms.append(f"-{var}")
-                            else:                    terms.append(f"{a_str} {var}")
-                        else:
-                            if abs(a - 1.0) < eps:   terms.append(f"{var}^{p}")
-                            elif abs(a + 1.0) < eps: terms.append(f"-{var}^{p}")
-                            else:                    terms.append(f"{a_str} {var}^{p}")
+                if p == 0:
+                    terms.append(f"{a_str}")
+                elif p == 1:
+                    if abs(a - 1.0) < eps:
+                        terms.append(f"{var}")
+                    elif abs(a + 1.0) < eps:
+                        terms.append(f"-{var}")
+                    else:
+                        terms.append(f"{a_str} {var}")
+                else:
+                    if abs(a - 1.0) < eps:
+                        terms.append(f"{var}^{p}")
+                    elif abs(a + 1.0) < eps:
+                        terms.append(f"-{var}^{p}")
+                    else:
+                        terms.append(f"{a_str} {var}^{p}")
 
-                    if not terms:
-                        return "0"
-                    s = " + ".join(terms)
-                    return s.replace("+ -", "- ")
+            if not terms:
+                return "0"
+            return " + ".join(terms).replace("+ -", "- ")
 
-                num_s = poly_str(num)
-                den_s = poly_str(den)
+        num_s = poly_str(num)
+        den_s = poly_str(den)
+        bar = "-" * max(len(num_s), len(den_s), 12)
+        return f"{num_s}\n{bar}\n{den_s}"
 
-                # simple fraction formatting
-                bar = "-" * max(len(num_s), len(den_s), 12)
-                return f"{num_s}\n{bar}\n{den_s}"
-
-    def _read_tf_from_rlocus_inputs(self):
-        def _f(le):
-            try:
-                t = le.text().strip()
-                return float(t) if t else 0.0
-            except Exception:
-                return 0.0
-
-        def _strip_leading_zeros(coefs, eps=1e-12):
-            c = list(map(float, coefs))
-            while len(c) > 1 and abs(c[0]) < eps:
-                c.pop(0)
-            return c
-
-        num = [_f(self.rlocus_num3), _f(self.rlocus_num2), _f(self.rlocus_num1), _f(self.rlocus_num0)]
-        den = [_f(self.rlocus_den3), _f(self.rlocus_den2), _f(self.rlocus_den1), _f(self.rlocus_den0)]
-
-        num = _strip_leading_zeros(num)
-        den = _strip_leading_zeros(den)
-
-        if all(abs(x) < 1e-12 for x in den):
-            raise ValueError("Denominator is all zeros.")
-
-        return ctrl.TransferFunction(num, den)
-    
     def _strip_titles_labels(self, ax, keep_x=False, keep_y=False):
         ax.set_title("")
         if not keep_x:
@@ -2942,15 +3044,23 @@ class MyDialog(QtWidgets.QDialog):
         return self._read_tf_from_rlocus_inputs()
 
     def open_big_rlocus(self):
-        sys = self._read_tf_from_rlocus_inputs()
-        dlg = ControlPlotDialog(self, sys)
-        dlg.exec()
+        try:
+            sys = self._read_tf_from_rlocus_inputs()
+            dlg = ControlPlotDialog(self, sys)
+            dlg.exec()
+        except Exception as e:
+            if hasattr(self, "plot_error"):
+                self.plot_error.setText(f"Root locus error: {e}")
 
     def open_big_zrlocus(self):
-        sysz = self._read_discrete_rlocus_sys()
-        Ts = float(self.sampling_time.text())
-        dlg = DiscreteControlPlotDialog(self, sysz, Ts)
-        dlg.exec()
+        try:
+            sysz = self._read_discrete_rlocus_sys()
+            Ts = float(self.sampling_time.text())
+            dlg = DiscreteControlPlotDialog(self, sysz, Ts)
+            dlg.exec()
+        except Exception as e:
+            if hasattr(self, "plot_error"):
+                self.plot_error.setText(f"Discrete root locus error: {e}")
 
     def _read_discrete_rlocus_sys(self):
         Gs = self._read_tf_from_rlocus_inputs()
@@ -3086,39 +3196,179 @@ class MyDialog(QtWidgets.QDialog):
                     bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15)
                 )
 
-    def _overlay_zgrid(self, ax, show_labels=True):
-        theta = np.linspace(0, 2 * np.pi, 500)
+    def _finite_complex_points(self, *values):
+        points = []
+        for value in values:
+            if value is None:
+                continue
+            try:
+                arr = np.asarray(value, dtype=complex).ravel()
+            except Exception:
+                continue
+            mask = np.isfinite(arr.real) & np.isfinite(arr.imag)
+            if np.any(mask):
+                points.append(arr[mask])
+        if not points:
+            return np.array([], dtype=complex)
+        return np.concatenate(points)
 
-        # turn off rectangular grid
+    def _axis_complex_points(self, ax):
+        points = []
+
+        for line in ax.lines:
+            try:
+                x = np.asarray(line.get_xdata(), dtype=float).ravel()
+                y = np.asarray(line.get_ydata(), dtype=float).ravel()
+            except Exception:
+                continue
+            n = min(len(x), len(y))
+            if n:
+                points.append(x[:n] + 1j * y[:n])
+
+        for collection in ax.collections:
+            try:
+                offsets = np.asarray(collection.get_offsets(), dtype=float)
+            except Exception:
+                continue
+            if offsets.ndim == 2 and offsets.shape[1] >= 2:
+                points.append(offsets[:, 0] + 1j * offsets[:, 1])
+
+        return self._finite_complex_points(*points)
+
+    def _set_zplane_limits(self, ax, points=None):
+        unit = np.exp(1j * np.linspace(0, 2 * np.pi, 360))
+
+        values = [unit]
+        if points is not None:
+            if isinstance(points, (list, tuple)):
+                values.extend(points)
+            else:
+                values.append(points)
+
+        pts = self._finite_complex_points(*values)
+        if len(pts) == 0:
+            pts = unit
+
+        xmin = float(np.min(pts.real))
+        xmax = float(np.max(pts.real))
+        ymin = float(np.min(pts.imag))
+        ymax = float(np.max(pts.imag))
+
+        span = max(xmax - xmin, ymax - ymin, 2.0)
+        span *= 1.12
+
+        xmid = 0.5 * (xmin + xmax)
+        ymid = 0.5 * (ymin + ymax)
+
+        ax.set_xlim(xmid - 0.5 * span, xmid + 0.5 * span)
+        ax.set_ylim(ymid - 0.5 * span, ymid + 0.5 * span)
+        ax.set_aspect('equal', adjustable='box')
+
+    def _overlay_zgrid(self, ax, show_labels=True, Ts=None):
         ax.grid(False)
 
-        # unit circle
+        try:
+            Ts = float(Ts)
+            if not np.isfinite(Ts) or Ts <= 0:
+                Ts = None
+        except Exception:
+            Ts = None
+
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        xmin, xmax = xlim
+        ymin, ymax = ylim
+
+        def _inside(z):
+            return xmin < z.real < xmax and ymin < z.imag < ymax
+
+        grid_color = '0.70'
+        light_color = '0.86'
+        grid_lw = 0.8
+        grid_ls = ':'
+
+        theta = np.linspace(0, 2 * np.pi, 720)
+
+        # Unit circle
         ax.plot(
             np.cos(theta), np.sin(theta),
-            color='0.65', lw=1.0, ls=':'
+            color=grid_color, lw=1.1, ls=grid_ls, zorder=1
         )
 
-        # axes
-        ax.axhline(0, color='0.75', lw=0.8)
-        ax.axvline(0, color='0.75', lw=0.8)
+        # Axes
+        ax.axhline(0, color='0.72', lw=0.8, zorder=1)
+        ax.axvline(0, color='0.72', lw=0.8, zorder=1)
 
-        # optional helper radial lines
-        for ang_deg in [30, 45, 60, 120, 135, 150, -30, -45, -60, -120, -135, -150]:
-            ang = np.deg2rad(ang_deg)
-            r = 1.1
+        # Constant damping-ratio curves mapped from s-plane through z = exp(s Ts).
+        theta_d = np.linspace(0.0, np.pi, 600)
+        zetas = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        for zeta in zetas:
+            beta = zeta / np.sqrt(max(1e-12, 1.0 - zeta**2))
+            radius = np.exp(-beta * theta_d)
+            z_upper = radius * np.exp(1j * theta_d)
             ax.plot(
-                [0, r * np.cos(ang)],
-                [0, r * np.sin(ang)],
-                color='0.88',
-                lw=0.6,
-                ls=':'
+                z_upper.real, z_upper.imag,
+                color=light_color, lw=grid_lw, ls=grid_ls, zorder=1
+            )
+            ax.plot(
+                z_upper.real, -z_upper.imag,
+                color=light_color, lw=grid_lw, ls=grid_ls, zorder=1
             )
 
+            if show_labels:
+                theta_label = 0.9
+                r_label = np.exp(-beta * theta_label)
+                z_label = r_label * np.exp(1j * theta_label)
+                if _inside(z_label):
+                    ax.text(
+                        z_label.real, z_label.imag,
+                        f"{zeta:.1f}",
+                        color='0.48', fontsize=8,
+                        ha='center', va='bottom',
+                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15),
+                        zorder=3
+                    )
+
+        # Constant natural-frequency curves. rho = wn * Ts is rad/sample.
+        rho_levels = np.linspace(np.pi / 5.0, np.pi, 5)
+        for rho in rho_levels:
+            theta_n = np.linspace(-rho, rho, 700)
+            log_radius = -np.sqrt(np.maximum(rho**2 - theta_n**2, 0.0))
+            radius = np.exp(log_radius)
+            z_curve = radius * np.exp(1j * theta_n)
+            ax.plot(
+                z_curve.real, z_curve.imag,
+                color=grid_color, lw=grid_lw, ls=grid_ls, zorder=1
+            )
+
+            if show_labels:
+                label_z = complex(np.exp(-rho), 0.0)
+                label = f"{rho / Ts:.3g}" if Ts else f"{rho:.2g}"
+                if _inside(label_z):
+                    ax.text(
+                        label_z.real, 0.025 * (ymax - ymin),
+                        label,
+                        color='0.45', fontsize=8,
+                        ha='center', va='bottom',
+                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15),
+                        zorder=3
+                    )
+
         if show_labels:
-            ax.text(1.02, 0.03, "1", color='0.45', fontsize=8)
-            ax.text(-1.08, 0.03, "-1", color='0.45', fontsize=8)
-            ax.text(0.03, 1.02, "j", color='0.45', fontsize=8)
-            ax.text(0.03, -1.08, "-j", color='0.45', fontsize=8)
+            labels = [
+                (complex(1.0, 0.0), "1", (4, 4), 'left', 'bottom'),
+                (complex(-1.0, 0.0), "-1", (-4, 4), 'right', 'bottom'),
+                (complex(0.0, 1.0), "j", (4, 4), 'left', 'bottom'),
+                (complex(0.0, -1.0), "-j", (4, -4), 'left', 'top'),
+            ]
+            for z, text, offset, ha, va in labels:
+                if _inside(z):
+                    ax.annotate(
+                        text, xy=(z.real, z.imag), xytext=offset,
+                        textcoords='offset points',
+                        color='0.45', fontsize=8, ha=ha, va=va,
+                        zorder=3
+                    )
 
     def open_big_pid_tuner_step(self):
         if self.pid_tuner_dialog_open:
@@ -3145,7 +3395,8 @@ class MyDialog(QtWidgets.QDialog):
 
         except Exception as e:
             self.pid_tuner_dialog_open = False
-            print(f"open_big_pid_tuner_step error: {e}")
+            if hasattr(self, "tuner_status"):
+                self.tuner_status.setText(f"PID tuner error: {e}")
 
     def discretize_function(self):
 
@@ -3266,6 +3517,8 @@ class MyDialog(QtWidgets.QDialog):
         num = self._strip_leading_zeros(num)
         den = self._strip_leading_zeros(den)
 
+        if all(abs(x) < 1e-12 for x in num):
+            raise ValueError("Numerator is all zeros.")
         if all(abs(x) < 1e-12 for x in den):
             raise ValueError("Denominator is all zeros.")
 
@@ -3331,6 +3584,39 @@ class MyDialog(QtWidgets.QDialog):
 
     def update_analysis_plots(self):
         try:
+            num_test = [
+                self._read_float(self.rlocus_num3),
+                self._read_float(self.rlocus_num2),
+                self._read_float(self.rlocus_num1),
+                self._read_float(self.rlocus_num0),
+            ]
+            den_test = [
+                self._read_float(self.rlocus_den3),
+                self._read_float(self.rlocus_den2),
+                self._read_float(self.rlocus_den1),
+                self._read_float(self.rlocus_den0),
+            ]
+            num_test = self._strip_leading_zeros(num_test)
+            den_test = self._strip_leading_zeros(den_test)
+
+            if all(abs(x) < 1e-12 for x in num_test) or all(abs(x) < 1e-12 for x in den_test):
+                self.ax_rl.clear()
+                self.ax_mag.clear()
+                self.ax_phase.clear()
+                self.ax_step.clear()
+
+                for ax in (self.ax_rl, self.ax_mag, self.ax_phase, self.ax_step):
+                    ax.grid(True)
+                    self._strip_titles_labels(ax, keep_x=False, keep_y=False)
+
+                self.canvas_rl.draw_idle()
+                self.canvas_bode.draw_idle()
+                self.canvas_step.draw_idle()
+
+                if hasattr(self, "plot_error"):
+                    self.plot_error.setText("")
+                return
+
             sys = self._read_tf_from_rlocus_inputs()
 
             # Clear all axes once
@@ -3341,7 +3627,7 @@ class MyDialog(QtWidgets.QDialog):
 
             # Root locus
             self.ax_rl.clear()
-            ctrl.root_locus_plot(sys, ax=self.ax_rl, grid=False)
+            plot_root_locus_clean(sys, self.ax_rl)
 
             xleft, xright = self.ax_rl.get_xlim()
             self.ax_rl.set_xlim(xleft, 0)
@@ -3431,9 +3717,11 @@ class MyDialog(QtWidgets.QDialog):
         PIDtype = self.PIDtype.currentIndex()
         reset_time = self.reset_time.text()
         self.SendData(StartStop, selected_mode, A, B, C, D, E, F, G, H, delay, tiemporeferencia, amplitud, referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time)
-        if selected_text == "Disabled":
+        if not self.controller_connected:
+            self.textBrowser.setText("Controlador desconectado, esperando reconexión")
+        elif selected_text == "Disabled":
             self.textBrowser.setText("System disabled, select an operation mode before starting")
-        if selected_text != "Disabled":
+        elif selected_text != "Disabled":
             self.textBrowser.setText("")
         if selected_mode == "0" or selected_mode == "1" :
             pi = self.graphWidgetRPM.getPlotItem()
@@ -3569,6 +3857,7 @@ class MyDialog(QtWidgets.QDialog):
     def update_graph(self):
         try:
             if self.serial_port is None or (hasattr(self.serial_port, "is_open") and not self.serial_port.is_open):
+                self._try_reconnect_serial()
                 return
 
             # Create file header once when saving is enabled
@@ -3584,8 +3873,19 @@ class MyDialog(QtWidgets.QDialog):
                 self.header_written = True
 
             # Read & process all available lines
-            while self.serial_port.in_waiting:
-                line = self.serial_port.readline(128).decode('utf-8', errors='ignore').strip()
+            try:
+                pending = self.serial_port.in_waiting
+            except (serial.SerialException, OSError) as e:
+                self._show_controller_disconnected(e)
+                return
+
+            while pending:
+                try:
+                    line = self.serial_port.readline(128).decode('utf-8', errors='ignore').strip()
+                    pending = self.serial_port.in_waiting
+                except (serial.SerialException, OSError) as e:
+                    self._show_controller_disconnected(e)
+                    return
                 self.serial_in.setText(line)
 
                 try:
@@ -3668,12 +3968,14 @@ class MyDialog(QtWidgets.QDialog):
         data_bytes = data_string.encode('utf-8')
         self.serial_out.setText(str(data_bytes))
         data_bytes = (data_string + '\n').encode('utf-8')
-        if self.serial_port is not None and (not hasattr(self.serial_port, "is_open") or self.serial_port.is_open):
-            try:
-                self.serial_port.write(data_bytes)
-            except Exception as e:
-                # If writing fails, show once
-                print(f"Serial write error: {e}")
+        if self.serial_port is None or (hasattr(self.serial_port, "is_open") and not self.serial_port.is_open):
+            self._try_reconnect_serial()
+            return
+
+        try:
+            self.serial_port.write(data_bytes)
+        except (serial.SerialTimeoutException, serial.SerialException, OSError) as e:
+            self._show_controller_disconnected(e)
 
     def update_slider_from_line_edit(self):
         try:
