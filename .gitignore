@@ -10,3 +10,4 @@ s_to_z_app.m
 QtDesignerGUI.ui
 .vscode/extensions.json
 .vscode/extensions.json
+.gui_config.json

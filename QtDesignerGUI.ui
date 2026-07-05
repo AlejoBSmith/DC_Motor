@@ -200,7 +200,7 @@
     <enum>QTabWidget::North</enum>
    </property>
    <property name="currentIndex">
-    <number>7</number>
+    <number>10</number>
    </property>
    <property name="iconSize">
     <size>
@@ -932,6 +932,25 @@
       </rect>
      </property>
     </widget>
+    <widget class="QLabel" name="label_18">
+     <property name="geometry">
+      <rect>
+       <x>50</x>
+       <y>55</y>
+       <width>230</width>
+       <height>75</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+     <property name="pixmap">
+      <pixmap>Block_Diagram.png</pixmap>
+     </property>
+     <property name="scaledContents">
+      <bool>true</bool>
+     </property>
+    </widget>
    </widget>
    <widget class="QWidget" name="tab_6">
     <attribute name="title">
@@ -1143,6 +1162,25 @@
        <width>36</width>
        <height>20</height>
       </rect>
+     </property>
+    </widget>
+    <widget class="QLabel" name="label_19">
+     <property name="geometry">
+      <rect>
+       <x>30</x>
+       <y>40</y>
+       <width>230</width>
+       <height>75</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+     <property name="pixmap">
+      <pixmap>rlocus.png</pixmap>
+     </property>
+     <property name="scaledContents">
+      <bool>true</bool>
      </property>
     </widget>
    </widget>
@@ -2080,6 +2118,25 @@
       </rect>
      </property>
     </widget>
+    <widget class="QLabel" name="label_17">
+     <property name="geometry">
+      <rect>
+       <x>15</x>
+       <y>65</y>
+       <width>230</width>
+       <height>75</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+     <property name="pixmap">
+      <pixmap>rlocusz.drawio.png</pixmap>
+     </property>
+     <property name="scaledContents">
+      <bool>true</bool>
+     </property>
+    </widget>
    </widget>
    <widget class="QWidget" name="Digital">
     <attribute name="title">
@@ -2324,6 +2381,25 @@
       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p align=&quot;center&quot;&gt;Look at the microcontroller code (main.cpp) for the implementation&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
      </property>
     </widget>
+    <widget class="QLabel" name="label_20">
+     <property name="geometry">
+      <rect>
+       <x>65</x>
+       <y>125</y>
+       <width>351</width>
+       <height>61</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+     <property name="pixmap">
+      <pixmap>Implemented_H(z).png</pixmap>
+     </property>
+     <property name="scaledContents">
+      <bool>true</bool>
+     </property>
+    </widget>
    </widget>
    <widget class="QWidget" name="tab_9">
     <attribute name="title">
@@ -2446,7 +2522,7 @@ p, li { white-space: pre-wrap; }
     <widget class="QLineEdit" name="deadzone">
      <property name="geometry">
       <rect>
-       <x>30</x>
+       <x>15</x>
        <y>75</y>
        <width>71</width>
        <height>20</height>
@@ -2456,9 +2532,9 @@ p, li { white-space: pre-wrap; }
     <widget class="QLabel" name="deadzone_label">
      <property name="geometry">
       <rect>
-       <x>30</x>
+       <x>15</x>
        <y>55</y>
-       <width>81</width>
+       <width>101</width>
        <height>16</height>
       </rect>
      </property>
@@ -2472,7 +2548,7 @@ p, li { white-space: pre-wrap; }
     <widget class="QLabel" name="label_15">
      <property name="geometry">
       <rect>
-       <x>30</x>
+       <x>15</x>
        <y>15</y>
        <width>346</width>
        <height>26</height>
@@ -2480,6 +2556,142 @@ p, li { white-space: pre-wrap; }
      </property>
      <property name="text">
       <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;span style=&quot; font-size:14pt; font-weight:600;&quot;&gt;Additional configuration parameters&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="label_21">
+     <property name="geometry">
+      <rect>
+       <x>345</x>
+       <y>15</y>
+       <width>181</width>
+       <height>106</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+     <property name="pixmap">
+      <pixmap>OSL.png</pixmap>
+     </property>
+     <property name="scaledContents">
+      <bool>true</bool>
+     </property>
+    </widget>
+    <widget class="QLineEdit" name="PWM_min">
+     <property name="geometry">
+      <rect>
+       <x>15</x>
+       <y>135</y>
+       <width>71</width>
+       <height>20</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QLabel" name="deadzone_label_2">
+     <property name="geometry">
+      <rect>
+       <x>15</x>
+       <y>115</y>
+       <width>101</width>
+       <height>16</height>
+      </rect>
+     </property>
+     <property name="toolTip">
+      <string>PWM values for which the motor does not respond. Can be characterized with triangular input signal.</string>
+     </property>
+     <property name="text">
+      <string>PWM out min</string>
+     </property>
+    </widget>
+    <widget class="QLineEdit" name="PWM_max">
+     <property name="geometry">
+      <rect>
+       <x>120</x>
+       <y>135</y>
+       <width>71</width>
+       <height>20</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QLabel" name="deadzone_label_3">
+     <property name="geometry">
+      <rect>
+       <x>120</x>
+       <y>115</y>
+       <width>101</width>
+       <height>16</height>
+      </rect>
+     </property>
+     <property name="toolTip">
+      <string>PWM values for which the motor does not respond. Can be characterized with triangular input signal.</string>
+     </property>
+     <property name="text">
+      <string>PWM out max</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="deadzone_label_4">
+     <property name="geometry">
+      <rect>
+       <x>120</x>
+       <y>55</y>
+       <width>101</width>
+       <height>16</height>
+      </rect>
+     </property>
+     <property name="toolTip">
+      <string>PWM values for which the motor does not respond. Can be characterized with triangular input signal.</string>
+     </property>
+     <property name="text">
+      <string>Encoder PPR</string>
+     </property>
+    </widget>
+    <widget class="QLineEdit" name="PPR">
+     <property name="geometry">
+      <rect>
+       <x>120</x>
+       <y>75</y>
+       <width>71</width>
+       <height>20</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QLineEdit" name="RPM_filter">
+     <property name="geometry">
+      <rect>
+       <x>15</x>
+       <y>195</y>
+       <width>71</width>
+       <height>20</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QLabel" name="deadzone_label_5">
+     <property name="geometry">
+      <rect>
+       <x>15</x>
+       <y>175</y>
+       <width>251</width>
+       <height>16</height>
+      </rect>
+     </property>
+     <property name="toolTip">
+      <string>PWM values for which the motor does not respond. Can be characterized with triangular input signal.</string>
+     </property>
+     <property name="text">
+      <string>RPM filter (moving average window size)</string>
+     </property>
+    </widget>
+    <widget class="QLabel" name="label_22">
+     <property name="geometry">
+      <rect>
+       <x>15</x>
+       <y>285</y>
+       <width>341</width>
+       <height>76</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;span style=&quot; font-weight:600;&quot;&gt;Changes here require pressing the &lt;/span&gt;&lt;/p&gt;&lt;p&gt;&lt;span style=&quot; font-weight:600;&quot;&gt;&amp;quot;Update Parameters&amp;quot; button to take effect&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
      </property>
     </widget>
    </widget>
@@ -2713,8 +2925,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="identdata">
    <property name="geometry">
     <rect>
-     <x>1045</x>
-     <y>490</y>
+     <x>1025</x>
+     <y>495</y>
      <width>171</width>
      <height>31</height>
     </rect>
@@ -2739,8 +2951,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLineEdit" name="tuner_tf">
    <property name="geometry">
     <rect>
-     <x>1120</x>
-     <y>505</y>
+     <x>1110</x>
+     <y>515</y>
      <width>56</width>
      <height>20</height>
     </rect>
@@ -2749,8 +2961,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QLineEdit" name="tuner_ts">
    <property name="geometry">
     <rect>
-     <x>1120</x>
-     <y>480</y>
+     <x>1105</x>
+     <y>535</y>
      <width>56</width>
      <height>20</height>
     </rect>
@@ -2884,8 +3096,8 @@ p, li { white-space: pre-wrap; }
   <widget class="QCheckBox" name="tuner_use_aw">
    <property name="geometry">
     <rect>
-     <x>1090</x>
-     <y>505</y>
+     <x>1075</x>
+     <y>535</y>
      <width>111</width>
      <height>21</height>
     </rect>
@@ -2898,7 +3110,7 @@ p, li { white-space: pre-wrap; }
    <property name="geometry">
     <rect>
      <x>1095</x>
-     <y>510</y>
+     <y>560</y>
      <width>56</width>
      <height>20</height>
     </rect>

@@ -35,7 +35,7 @@ struct ControlParams {
   float previousError = 0;
   float previousOutput = 0;
   float controladorOUT = 0;
-  const int PPR = 240; // Pulsos por revolución encoder
+  int PPR = 240; // Pulsos por revolución encoder
   int PWMOUT = 0;
   int ZM = 10; // ZM es la zona muerta del motor, se identifica con System Ident, con onda triangular
   float A_cont = 0;
@@ -112,7 +112,8 @@ EncoderData enc;
 SerialData serialData;
 MeasurementsData meas;
 
-constexpr int COMMAND_FIELD_COUNT = 25;
+constexpr int LEGACY_COMMAND_FIELD_COUNT = 25;
+constexpr int COMMAND_FIELD_COUNT = 29;
 int avgwindowsize = 1;
 int currentwindowsize = 4; //la medición de corriente es particularmente ruidosa
 MovingAvgF RPMAvg(avgwindowsize);
@@ -201,6 +202,33 @@ int32_t readEncoderTicks() {
   return ticks;
 }
 
+void setPwmLimits(int pwmMin, int pwmMax) {
+  pwmMin = constrain(pwmMin, 0, 255);
+  pwmMax = constrain(pwmMax, 0, 255);
+  if (pwmMax < pwmMin) {
+    int tmp = pwmMin;
+    pwmMin = pwmMax;
+    pwmMax = tmp;
+  }
+  sys.pwmMinimoLinealidad = pwmMin;
+  sys.pwmMaximoLinealidad = pwmMax;
+}
+
+int randomPwmReference() {
+  if (sys.pwmMaximoLinealidad <= sys.pwmMinimoLinealidad) {
+    return sys.pwmMinimoLinealidad;
+  }
+  return random(sys.pwmMinimoLinealidad, sys.pwmMaximoLinealidad + 1);
+}
+
+void setRpmFilterWindow(int windowSize) {
+  windowSize = constrain(windowSize, 1, (int)MovingAvgF::MAX_N);
+  if (avgwindowsize != windowSize) {
+    avgwindowsize = windowSize;
+    RPMAvg.setWindow((size_t)avgwindowsize);
+  }
+}
+
 float PRBS() {
     static bool is_zero = false; // Track current phase
     static unsigned long last_switch = 0;
@@ -216,7 +244,7 @@ float PRBS() {
 
         if (!is_zero) {
             // On new value phase, pick random value
-            sys.referencia = random(sys.pwmMinimoLinealidad, sys.pwmMaximoLinealidad);
+            sys.referencia = randomPwmReference();
         }
     }
 
@@ -413,7 +441,7 @@ void loop() {
 
     String parts[COMMAND_FIELD_COUNT];
     int fieldCount = divideString(serialData.DatoSerial, ',', parts, COMMAND_FIELD_COUNT);
-    if (fieldCount == COMMAND_FIELD_COUNT) {
+    if (fieldCount == LEGACY_COMMAND_FIELD_COUNT || fieldCount == COMMAND_FIELD_COUNT) {
       sys.inicio              = parts[0].toInt();
       sys.modooperacion       = parts[1].toInt();
       ctrl.A_cont             = parts[2].toFloat();
@@ -442,10 +470,19 @@ void loop() {
       ctrl.PIDtype            = parts[22].toInt();
       sys.tiporef             = parts[23].toInt();
       ctrl.reset_time         = parts[24].toFloat();
+      if (fieldCount == COMMAND_FIELD_COUNT) {
+        ctrl.PPR              = parts[25].toInt();
+        int pwmMin            = parts[26].toInt();
+        int pwmMax            = parts[27].toInt();
+        int rpmFilterWindow   = parts[28].toInt();
+        setPwmLimits(pwmMin, pwmMax);
+        setRpmFilterWindow(rpmFilterWindow);
+      }
 
       if (timing.delayintencional < 1) timing.delayintencional = 1;
       if (ctrl.time_constant < 1e-6f) ctrl.time_constant = 1e-6f;
       if (ctrl.reset_time < 1e-6f) ctrl.reset_time = 1e-6f;
+      if (ctrl.PPR < 1) ctrl.PPR = 1;
       ctrl.PIDtype = constrain(ctrl.PIDtype, 0, 1);
       ctrl.ZM = constrain(ctrl.ZM, 0, 255);
       sys.tiporef = sys.tiporef ? 1 : 0;
@@ -472,11 +509,11 @@ void loop() {
         case 1: { // System Identification
           sys.referencia      = ActualizarReferencia();
           ctrl.controladorOUT = sys.referencia;
-          ctrl.controladorOUT = constrain(ctrl.controladorOUT, 0, 255);
           if (timing.tiempociclo < 1) timing.tiempociclo = timing.delayintencional;
           meas.RPM         = consumeEncoderTicks() / (float)timing.tiempociclo * 60.0f * 1000.0f / (4.0f * ctrl.PPR);
           meas.RPMPromedio = RPMAvg.reading(meas.RPM);
-          ctrl.PWMOUT = (int)lroundf(ctrl.controladorOUT);
+          ctrl.PWMOUT = constrain(ctrl.controladorOUT,0,255);
+          ctrl.controladorOUT = ctrl.PWMOUT;
           analogWrite(pins.pwmPin, ctrl.PWMOUT);
           sys.medicion = meas.RPMPromedio;
           break;
@@ -498,7 +535,7 @@ void loop() {
             }
             if (sys.referencia != 0){
               ctrl.PWMOUT = ctrl.controladorOUT + ctrl.ZM; // zona muerta solo si ref ≠ 0
-              ctrl.PWMOUT = constrain(ctrl.PWMOUT, 0, 255);
+              ctrl.PWMOUT = constrain(ctrl.PWMOUT,0,255);
             } else {
               resetControllerMemory();
             }
@@ -507,7 +544,7 @@ void loop() {
             ctrl.controladorOUT = EcuacionDiferencias();
             if (sys.referencia != 0){
               ctrl.PWMOUT = ctrl.controladorOUT + ctrl.ZM;
-              ctrl.PWMOUT = constrain(ctrl.PWMOUT, 0, 255);
+              ctrl.PWMOUT = constrain(ctrl.PWMOUT,0,255);
             } else {
               resetControllerMemory();
             }
@@ -556,7 +593,7 @@ void loop() {
           #endif
 
           ctrl.controladorOUT = u;
-          ctrl.PWMOUT         = abs((int)u); 
+          ctrl.PWMOUT         = constrain(fabsf(u),0,255); // el PWM debe ser igual de 0 a 255, aunque U puede ser negativo o positivo, para que el motor pueda girar hacia atrás
           analogWrite(pins.pwmPin, ctrl.PWMOUT);
           sys.medicion = (int)sys.deg;
           break;

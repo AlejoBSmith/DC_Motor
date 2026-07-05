@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import warnings
 import pyqtgraph as pg
 import serial
@@ -40,6 +41,7 @@ KNOWN_VIDPID = {
     (0x2341, 0x006C),  # Arduino UNO R4 Minima
 }
 PREF_DESCR = ("Teensy", "UNO R4")  # optional: bias by description text
+LINE_EDIT_CONFIG_FILENAME = ".gui_config.json"
 
 def auto_find_port():
     ports = list(serial.tools.list_ports.comports())
@@ -1749,6 +1751,48 @@ class MyDialog(QtWidgets.QDialog):
         super(MyDialog, self).__init__(parent)
         ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "QtDesignerGUI.ui")
         uic.loadUi(ui_path, self)  # load the UI first
+        self._line_edit_config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            LINE_EDIT_CONFIG_FILENAME,
+        )
+        self._line_edit_config_loading = False
+        self._line_edit_default_values = {
+            "A": "0",
+            "B": "0",
+            "C": "0",
+            "D": "0",
+            "E": "0",
+            "F": "0",
+            "G": "0",
+            "H": "0",
+            "deadzone": "0",
+            "offset": "0",
+            "tiemporeferencia": "2000",
+            "amplitude": "150",
+            "reference": "150",
+            "delay": "20",
+            "Kp": "0",
+            "Ki": "0",
+            "Kd": "0",
+            "denorder": "1",
+            "numorder": "0",
+            "datapoints": "200",
+            "x_scale": "5",
+            "time_constant": "0.2",
+            "reset_time": "0.5",
+            "tuner_output_min": "0",
+            "tuner_output_max": "255",
+            "sampling_time": "0.02",
+            "lqr_sampling": "0.02",
+            "PPR": "240",
+            "PWM_min": "0",
+            "PWM_max": "255",
+            "RPM_filter": "1",
+        }
+        self._clear_initial_line_edits()
+        self._persistent_line_edit_names = self._collect_persistent_line_edit_names()
+        self._load_line_edit_config()
+        self._runtime_config_values = self._default_runtime_config_values()
         # ---- make the dialog look/behave like a normal resizable window ----
         flags = self.windowFlags()
         flags |= Qt.WindowType.WindowSystemMenuHint          # show system menu
@@ -1800,7 +1844,7 @@ class MyDialog(QtWidgets.QDialog):
         #self.manualinput.setVisible(True)
         #self.automaticinput.setVisible(True)
 
-        datapoints = 1000
+        datapoints = self._line_edit_int(self.datapoints, default=200, minimum=1)
         self.dataRPM_setpoint = deque(maxlen=datapoints)
         self.dataRPM_measured = deque(maxlen=datapoints)
         self.dataPWM = deque(maxlen=datapoints)
@@ -1929,7 +1973,7 @@ class MyDialog(QtWidgets.QDialog):
         self.discretize.clicked.connect(self.discretize_function)
 
         # Define botón de update parameters
-        self.update_parameters.clicked.connect(self.toggleupdate_parameters)
+        self.update_parameters.clicked.connect(self._on_update_parameters_clicked)
         # Define botón de identificación de sistema
         self.identify.clicked.connect(self.identify_system)
         # Define botón de simulación
@@ -1995,6 +2039,7 @@ class MyDialog(QtWidgets.QDialog):
         self.curve_setpoint = self.graphWidgetRPM.plot(name="Input", pen=pg.mkPen(color='b', width=3, style=QtCore.Qt.PenStyle.SolidLine))  # Blue line for setpoint
         self.curve_measured = self.graphWidgetRPM.plot(name="Output", pen=pg.mkPen(color='r', width=3, style=QtCore.Qt.PenStyle.SolidLine))  # Red line for measured
         self.curve_pwm = self.graphWidgetPWM.plot(name="PWM", pen=pg.mkPen(color='g', width=3, style=QtCore.Qt.PenStyle.SolidLine))       # Green line for PWM
+        self._set_runtime_plot_interaction(enabled=True)
 
         # Disconnect the standard dialog accept/reject slots
         # Esto se hace para quitarle los valores por default que tienen los botones de
@@ -2012,40 +2057,15 @@ class MyDialog(QtWidgets.QDialog):
         self.timer.timeout.connect(self.update_graph)
         self.pid_tuner_dialog_open = False
 
-        # Se inicializan los valores
-        self.A.setText("0")
-        self.B.setText("0")
-        self.C.setText("0")
-        self.D.setText("0")
-        self.E.setText("0")
-        self.F.setText("0")
-        self.G.setText("0")
-        self.H.setText("0")
-        self.deadzone.setText("0")
-        self.offset.setText("0")
-        self.serial_in.setText(" ")
-        self.serial_out.setText(" ")
-        self.tiemporeferencia.setText("2000")
-        self.amplitude.setText("150")
-        self.reference.setText("150")
-        self.delay.setText("20")
+        # Keep line edits visually empty on a fresh install; runtime defaults are
+        # read from _line_edit_default_values when a field is blank.
         self.modooperacion.setCurrentIndex(0)
-        self.Kp.setText("0")
-        self.Ki.setText("0")
-        self.Kd.setText("0")
-        self.denorder.setText("1")
-        self.numorder.setText("0")
-        self.datapoints.setText("200")
-        self.x_scale.setText("5")
-        self.time_constant.setText("0.2")
-        self.reset_time.setText("0.5")
-        self.tuner_output_min.setText("0")
-        self.tuner_output_max.setText("255")
-        self.sampling_time.setText("0.02")
         self.tabWidget.blockSignals(True)
         self.tabWidget.setCurrentIndex(0)
         self.tabWidget.blockSignals(False)
+        self._sync_reference_slider_to_line_edit()
         self._update_reference_controls_visibility()
+        self._connect_line_edit_config_saves()
 
         # Comienza todos los timers
         self.timer.start()
@@ -2142,8 +2162,201 @@ class MyDialog(QtWidgets.QDialog):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setAutoRaise(False)
 
+    def _clear_initial_line_edits(self):
+        for line_edit in self.findChildren(QtWidgets.QLineEdit):
+            line_edit.clear()
+
+    def _collect_persistent_line_edit_names(self):
+        excluded = {
+            "serial_in",
+            "serial_out",
+            "rmse",
+            "mae",
+            "r2",
+            "nrmse",
+            "tuner_kp",
+            "tuner_ki",
+            "tuner_kd",
+            "tuner_tf",
+            "tuner_ts",
+        }
+        names = []
+        for line_edit in self.findChildren(QtWidgets.QLineEdit):
+            name = line_edit.objectName()
+            if name and name not in excluded and not line_edit.isReadOnly():
+                names.append(name)
+        return tuple(sorted(set(names)))
+
+    def _load_line_edit_config(self):
+        if not os.path.exists(self._line_edit_config_path):
+            return
+
+        try:
+            with open(self._line_edit_config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"Could not load GUI config: {e}")
+            return
+
+        values = data.get("line_edits", {})
+        if not isinstance(values, dict):
+            return
+
+        self._line_edit_config_loading = True
+        try:
+            for name in self._persistent_line_edit_names:
+                if name not in values:
+                    continue
+                widget = getattr(self, name, None)
+                if isinstance(widget, QtWidgets.QLineEdit):
+                    value = values[name]
+                    widget.setText("" if value is None else str(value))
+        finally:
+            self._line_edit_config_loading = False
+
+    def _connect_line_edit_config_saves(self):
+        for name in self._persistent_line_edit_names:
+            widget = getattr(self, name, None)
+            if isinstance(widget, QtWidgets.QLineEdit):
+                widget.textChanged.connect(self._save_line_edit_config)
+
+    def _save_line_edit_config(self, *_args):
+        if self._line_edit_config_loading:
+            return
+
+        values = {}
+        for name in self._persistent_line_edit_names:
+            widget = getattr(self, name, None)
+            if isinstance(widget, QtWidgets.QLineEdit):
+                values[name] = widget.text()
+
+        data = {
+            "version": 1,
+            "line_edits": values,
+        }
+
+        tmp_path = f"{self._line_edit_config_path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp_path, self._line_edit_config_path)
+        except Exception as e:
+            print(f"Could not save GUI config: {e}")
+
+    def _line_edit_default(self, widget, fallback=0.0):
+        name = widget.objectName() if hasattr(widget, "objectName") else ""
+        return self._line_edit_default_values.get(name, fallback)
+
+    def _line_edit_number(self, widget, default=None, minimum=None, maximum=None, integer=False):
+        if default is None:
+            default = self._line_edit_default(widget, 0.0)
+
+        text = widget.text().strip() if hasattr(widget, "text") else str(widget).strip()
+        raw_value = text if text else default
+        try:
+            value = float(str(raw_value).replace(",", "."))
+        except (TypeError, ValueError):
+            value = float(default)
+
+        if minimum is not None:
+            value = max(float(minimum), value)
+        if maximum is not None:
+            value = min(float(maximum), value)
+
+        if integer:
+            return int(round(value))
+        return value
+
+    def _line_edit_int(self, widget, default=None, minimum=None, maximum=None):
+        return self._line_edit_number(
+            widget,
+            default=default,
+            minimum=minimum,
+            maximum=maximum,
+            integer=True,
+        )
+
+    def _line_edit_float(self, widget, default=None, minimum=None, maximum=None):
+        return self._line_edit_number(
+            widget,
+            default=default,
+            minimum=minimum,
+            maximum=maximum,
+            integer=False,
+        )
+
+    def _sync_reference_slider_to_line_edit(self):
+        value = self._line_edit_int(self.reference, default=150)
+        self.slider.blockSignals(True)
+        self.slider.setValue(value)
+        self.slider.blockSignals(False)
+
+    def _default_runtime_config_values(self):
+        return {
+            "PPR": 240,
+            "PWM_min": 0,
+            "PWM_max": 255,
+            "RPM_filter": 1,
+        }
+
+    def _read_runtime_config_values_from_ui(self):
+        ppr = self._line_edit_int(self.PPR, default=240, minimum=1)
+        pwm_min = self._line_edit_int(self.PWM_min, default=0, minimum=0, maximum=255)
+        pwm_max = self._line_edit_int(self.PWM_max, default=255, minimum=0, maximum=255)
+        if pwm_max < pwm_min:
+            pwm_min, pwm_max = pwm_max, pwm_min
+
+        rpm_filter = self._line_edit_int(
+            self.RPM_filter,
+            default=1,
+            minimum=1,
+            maximum=64,
+        )
+
+        return {
+            "PPR": ppr,
+            "PWM_min": pwm_min,
+            "PWM_max": pwm_max,
+            "RPM_filter": rpm_filter,
+        }
+
+    def _on_update_parameters_clicked(self, checked=False):
+        self.toggleupdate_parameters(update_runtime_config=True)
+
     def _on_save_values_toggled(self, checked):
         self.header_written = False
+
+    def _runtime_plot_widgets(self):
+        return (self.graphWidgetRPM, self.graphWidgetPWM)
+
+    def _set_runtime_plot_interaction(self, enabled):
+        for plot_widget in self._runtime_plot_widgets():
+            plot_item = plot_widget.getPlotItem()
+            view_box = plot_item.getViewBox()
+            view_box.setMouseEnabled(x=enabled, y=enabled)
+            if hasattr(view_box, "setMenuEnabled"):
+                view_box.setMenuEnabled(enabled)
+            if hasattr(plot_item, "setMenuEnabled"):
+                plot_item.setMenuEnabled(enabled)
+            plot_widget.setCursor(
+                Qt.CursorShape.OpenHandCursor if enabled else Qt.CursorShape.ArrowCursor
+            )
+
+    def _reset_runtime_plots(self):
+        datapoints = self.dataRPM_setpoint.maxlen or 1000
+        self.dataRPM_setpoint = deque(maxlen=datapoints)
+        self.dataRPM_measured = deque(maxlen=datapoints)
+        self.dataPWM = deque(maxlen=datapoints)
+        self.dataDT = deque(maxlen=datapoints)
+
+        self.curve_setpoint.setData([], [])
+        self.curve_measured.setData([], [])
+        self.curve_pwm.setData([], [])
+        self.graphWidgetRPM.setXRange(0.0, 1.0, padding=0)
+        self.graphWidgetPWM.setXRange(0.0, 1.0, padding=0)
+        self.graphWidgetRPM.setYRange(0.0, 120.0)
+        self.graphWidgetPWM.setYRange(0.0, 255.0)
 
     def _reference_controls_enabled_for_mode(self):
         return True
@@ -2166,23 +2379,16 @@ class MyDialog(QtWidgets.QDialog):
         if hasattr(self, "graphWidgetRPM"):
             self.toggleupdate_parameters()
 
-    def _numeric_text(self, widget, default=0.0, minimum=None, maximum=None, integer=False):
-        text = widget.text().strip() if hasattr(widget, "text") else str(widget).strip()
-        if not text:
-            value = default
-        else:
-            try:
-                value = float(text.replace(",", "."))
-            except ValueError:
-                value = default
-
-        if minimum is not None:
-            value = max(float(minimum), value)
-        if maximum is not None:
-            value = min(float(maximum), value)
-
+    def _numeric_text(self, widget, default=None, minimum=None, maximum=None, integer=False):
+        value = self._line_edit_number(
+            widget,
+            default=default,
+            minimum=minimum,
+            maximum=maximum,
+            integer=integer,
+        )
         if integer:
-            return str(int(round(value)))
+            return str(value)
         return f"{value:.9g}"
 
     def _set_plot_y_range(self, plot_widget, ymin, ymax, include_zero=False):
@@ -2226,7 +2432,7 @@ class MyDialog(QtWidgets.QDialog):
 
             # Get the user-defined time scale from x_scale
             try:
-                t_max = float(self.x_scale.text()) if self.x_scale.text() else 5.0  # Default to 5 sec
+                t_max = self._line_edit_float(self.x_scale, default=5.0)  # Default to 5 sec
                 if t_max <= 0:
                     self.textBrowser.setText("Time scale must be greater than zero.")
                     return
@@ -2445,11 +2651,7 @@ class MyDialog(QtWidgets.QDialog):
         if all(abs(x) < 1e-12 for x in den):
             raise ValueError("Discrete RL denominator is all zeros.")
 
-        Ts_txt = self.lqr_sampling.text().strip()
-        if not Ts_txt:
-            raise ValueError("Enter sampling time first.")
-
-        Ts = float(Ts_txt)
+        Ts = self._line_edit_float(self.lqr_sampling, default=0.02)
         if Ts <= 0:
             raise ValueError("Sampling time must be greater than zero.")
 
@@ -2601,7 +2803,7 @@ class MyDialog(QtWidgets.QDialog):
     def open_big_zrlocus_from_tab(self):
         try:
             sysz = self._read_tf_from_zrlocus_inputs()
-            Ts = float(self.lqr_sampling.text())
+            Ts = self._line_edit_float(self.lqr_sampling, default=0.02, minimum=1e-9)
             dlg = DiscreteControlPlotDialog(self, sysz, Ts)
             dlg.exec()
         except Exception as e:
@@ -2778,7 +2980,7 @@ class MyDialog(QtWidgets.QDialog):
 
     def _pid_tuner_derivative_filter_time(self):
         try:
-            Tf = float(self.time_constant.text())
+            Tf = self._line_edit_float(self.time_constant, default=0.2)
         except Exception:
             Tf = 0.008
         return max(Tf, 1e-6)
@@ -3160,7 +3362,7 @@ class MyDialog(QtWidgets.QDialog):
     def open_big_zrlocus(self):
         try:
             sysz = self._read_discrete_rlocus_sys()
-            Ts = float(self.sampling_time.text())
+            Ts = self._line_edit_float(self.sampling_time, default=0.02, minimum=1e-9)
             dlg = DiscreteControlPlotDialog(self, sysz, Ts)
             dlg.exec()
         except Exception as e:
@@ -3170,11 +3372,7 @@ class MyDialog(QtWidgets.QDialog):
     def _read_discrete_rlocus_sys(self):
         Gs = self._read_tf_from_rlocus_inputs()
 
-        Ts_txt = self.sampling_time.text().strip()
-        if not Ts_txt:
-            raise ValueError("Enter sampling time Ts first.")
-
-        Ts = float(Ts_txt)
+        Ts = self._line_edit_float(self.sampling_time, default=0.02)
         if Ts <= 0:
             raise ValueError("Sampling time Ts must be greater than zero.")
 
@@ -3539,7 +3737,9 @@ class MyDialog(QtWidgets.QDialog):
                 float(self.sden1.text() or 0),
                 float(self.sden0.text() or 0),
             ]
-            T_s   = float(self.sampling_time.text())
+            T_s = self._line_edit_float(self.sampling_time, default=0.02)
+            if T_s <= 0:
+                raise ValueError("Sampling time must be greater than zero.")
             method = self.method.currentText()  # e.g., 'zoh', 'foh', 'bilinear' (tustin)
 
             # Clean leading zeros (highest powers)
@@ -3585,7 +3785,7 @@ class MyDialog(QtWidgets.QDialog):
 
     def resize_deque(self):
         try:
-            datapoints = int(float(self.datapoints.text().strip()))
+            datapoints = self._line_edit_int(self.datapoints, default=200, minimum=1)
         except ValueError:
             return
         datapoints = max(1, datapoints)
@@ -3794,7 +3994,10 @@ class MyDialog(QtWidgets.QDialog):
     def tabChanged(self):
         self.toggleupdate_parameters()
 
-    def toggleupdate_parameters(self):
+    def toggleupdate_parameters(self, update_runtime_config=False):
+        if update_runtime_config:
+            self._runtime_config_values = self._read_runtime_config_values_from_ui()
+
         # Collect the current values from UI elements or class variables
         StartStop = '0' if self.StartStop.text() == "Start" else '1'
         A = self._numeric_text(self.A)
@@ -3805,25 +4008,30 @@ class MyDialog(QtWidgets.QDialog):
         F = self._numeric_text(self.F)
         G = self._numeric_text(self.G)
         H = self._numeric_text(self.H)
-        delay = self._numeric_text(self.delay, default=1, minimum=1, integer=True)
+        delay = self._numeric_text(self.delay, minimum=1, integer=True)
         # Send the data
         tiporef = int(self.automaticinput.isChecked())
         tiposenal = self.tiposenal.currentIndex()
         selected_text = self.modooperacion.currentText()
         selected_mode = self.mode_map.get(selected_text, "0")
-        tiemporeferencia = self._numeric_text(self.tiemporeferencia, default=1, minimum=1, integer=True)
-        amplitud = self._numeric_text(self.amplitude, default=0, integer=True)
-        referenciaManual = self._numeric_text(self.reference, default=0, integer=True)
-        offset = self._numeric_text(self.offset, default=0, integer=True)
+        tiemporeferencia = self._numeric_text(self.tiemporeferencia, minimum=1, integer=True)
+        amplitud = self._numeric_text(self.amplitude, integer=True)
+        referenciaManual = self._numeric_text(self.reference, integer=True)
+        offset = self._numeric_text(self.offset, integer=True)
         activetab = self.tabWidget.currentIndex()
         Kp = self._numeric_text(self.Kp)
         Ki = self._numeric_text(self.Ki)
         Kd = self._numeric_text(self.Kd)
-        deadzone = self._numeric_text(self.deadzone, default=0, minimum=0, maximum=255, integer=True)
-        time_constant = self._numeric_text(self.time_constant, default=0.01, minimum=1e-6)
+        deadzone = self._numeric_text(self.deadzone, minimum=0, maximum=255, integer=True)
+        time_constant = self._numeric_text(self.time_constant, minimum=1e-6)
         PIDtype = self.PIDtype.currentIndex()
-        reset_time = self._numeric_text(self.reset_time, default=0.1, minimum=1e-6)
-        self.SendData(StartStop, selected_mode, A, B, C, D, E, F, G, H, delay, tiemporeferencia, amplitud, referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time)
+        reset_time = self._numeric_text(self.reset_time, minimum=1e-6)
+        runtime_config = self._runtime_config_values
+        PPR = runtime_config["PPR"]
+        PWM_min = runtime_config["PWM_min"]
+        PWM_max = runtime_config["PWM_max"]
+        RPM_filter = runtime_config["RPM_filter"]
+        self.SendData(StartStop, selected_mode, A, B, C, D, E, F, G, H, delay, tiemporeferencia, amplitud, referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time,PPR,PWM_min,PWM_max,RPM_filter)
         if not self.controller_connected:
             self.textBrowser.setText("Controlador desconectado, esperando reconexión")
         elif selected_text == "Disabled":
@@ -3845,12 +4053,13 @@ class MyDialog(QtWidgets.QDialog):
 
     def toggleStartStop(self):
         if self.isRunning:
+            self.isRunning = False
             self.StartStop.setText("Start")
             self.StopAction()
         else:
+            self.isRunning = True
             self.StartStop.setText("Stop")
             self.StartAction()
-        self.isRunning = not self.isRunning
 
     def _estimate_static_gain(self, u, y):
         u = np.asarray(u, dtype=float).ravel()
@@ -4025,8 +4234,8 @@ class MyDialog(QtWidgets.QDialog):
             y  = np.array(self.dataRPM_measured, dtype=float)    # output (RPM)
             dt = np.array(self.dataDT, dtype=float) / 1000.0     # ms -> s
 
-            numorder = int(self.numorder.text())
-            denorder = int(self.denorder.text())
+            numorder = self._line_edit_int(self.numorder, default=0, minimum=0)
+            denorder = self._line_edit_int(self.denorder, default=1, minimum=0)
 
             # Basic sanity checks
             if min(len(u), len(y), len(dt)) < 10:
@@ -4112,6 +4321,9 @@ class MyDialog(QtWidgets.QDialog):
 
     def update_graph(self):
         try:
+            if not self.isRunning:
+                return
+
             if self.serial_port is None or (hasattr(self.serial_port, "is_open") and not self.serial_port.is_open):
                 self._try_reconnect_serial()
                 return
@@ -4214,11 +4426,14 @@ class MyDialog(QtWidgets.QDialog):
 
     def StartAction(self):
         print("Inicio control motor")
+        self._reset_runtime_plots()
+        self._set_runtime_plot_interaction(enabled=False)
         self.toggleupdate_parameters()
 
     def StopAction(self):
         print("Paro de control de motor")
         self.toggleupdate_parameters()
+        self._set_runtime_plot_interaction(enabled=True)
 
     def closeEvent(self, event):
         try:
@@ -4231,8 +4446,8 @@ class MyDialog(QtWidgets.QDialog):
             print(f"closeEvent serial cleanup error: {e}")
         super().closeEvent(event)
 
-    def SendData(self, StartStop, selected_mode, A, B, C, D, E, F, G, H,delay,tiemporeferencia,amplitud,referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time):
-        data_string=f"{StartStop},{selected_mode},{A},{B},{C},{D},{E},{F},{G},{H},{delay},{tiemporeferencia},{amplitud},{referenciaManual},{offset},{tiposenal},{activetab},{Kp},{Ki},{Kd},{deadzone},{time_constant},{PIDtype},{tiporef},{reset_time}"
+    def SendData(self, StartStop, selected_mode, A, B, C, D, E, F, G, H,delay,tiemporeferencia,amplitud,referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time,PPR,PWM_min,PWM_max,RPM_filter):
+        data_string=f"{StartStop},{selected_mode},{A},{B},{C},{D},{E},{F},{G},{H},{delay},{tiemporeferencia},{amplitud},{referenciaManual},{offset},{tiposenal},{activetab},{Kp},{Ki},{Kd},{deadzone},{time_constant},{PIDtype},{tiporef},{reset_time},{PPR},{PWM_min},{PWM_max},{RPM_filter}"
         data_bytes = (data_string + '\n').encode('utf-8')
         self.serial_out.setText(data_string)
         if self.serial_port is None or (hasattr(self.serial_port, "is_open") and not self.serial_port.is_open):
