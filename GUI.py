@@ -2291,6 +2291,7 @@ class MyDialog(QtWidgets.QDialog):
 
     def _collect_persistent_line_edit_names(self):
         excluded = {
+            "DMMout",
             "serial_in",
             "serial_out",
             "rmse",
@@ -2447,10 +2448,13 @@ class MyDialog(QtWidgets.QDialog):
     def _on_update_parameters_clicked(self, checked=False):
         self.toggleupdate_parameters(update_runtime_config=True)
 
-    def _on_save_values_toggled(self, checked):
+    def _reset_recording_state(self):
         self.header_written = False
         self._recording_include_dmm = False
         self._recording_start_monotonic = None
+
+    def _on_save_values_toggled(self, checked):
+        self._reset_recording_state()
 
     def _on_time_delimited_toggled(self, checked):
         if hasattr(self, "test_time"):
@@ -4590,9 +4594,7 @@ class MyDialog(QtWidgets.QDialog):
 
             # Reset file header state when saving is disabled.
             if not self.saveValuesCheckBox.isChecked():
-                self.header_written = False
-                self._recording_include_dmm = False
-                self._recording_start_monotonic = None
+                self._reset_recording_state()
 
             # Read & process all available lines
             try:
@@ -4708,6 +4710,7 @@ class MyDialog(QtWidgets.QDialog):
 
     def StartAction(self):
         print("Inicio control motor")
+        self._reset_recording_state()
         self._reset_runtime_plots()
         self._set_runtime_plot_interaction(enabled=False)
         self.toggleupdate_parameters()
