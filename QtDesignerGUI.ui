@@ -180,7 +180,7 @@
     <enum>QTabWidget::North</enum>
    </property>
    <property name="currentIndex">
-    <number>11</number>
+    <number>5</number>
    </property>
    <property name="iconSize">
     <size>
@@ -1571,12 +1571,12 @@
      </property>
      <item>
       <property name="text">
-       <string>Positional PID</string>
+       <string>Incremental PID</string>
       </property>
      </item>
      <item>
       <property name="text">
-       <string>Incremental PID</string>
+       <string>Positional PID</string>
       </property>
      </item>
     </widget>
@@ -3291,7 +3291,7 @@ p, li { white-space: pre-wrap; }
     </property>
    </widget>
   </widget>
-  <widget class="QWidget" name="">
+  <widget class="QWidget" name="layoutWidget">
    <property name="geometry">
     <rect>
      <x>765</x>
