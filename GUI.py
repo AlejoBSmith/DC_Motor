@@ -9,7 +9,7 @@ import numpy as np
 import control as ctrl
 from datetime import datetime
 from collections import deque
-from time import monotonic
+from time import monotonic, sleep
 from PyQt6 import QtCore, QtWidgets, uic
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
@@ -62,6 +62,108 @@ def plot_root_locus_clean(sys, ax):
             category=UserWarning,
         )
         return ctrl.root_locus_plot(sys, ax=ax, grid=False, interactive=False)
+
+class SiglentDMMWorker(QtCore.QObject):
+    sample_ready = QtCore.pyqtSignal(float, float, int)
+    status_changed = QtCore.pyqtSignal(str)
+    error = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, resource_name=None, poll_interval_s=0.02, parent=None):
+        super().__init__(parent)
+        self.resource_name = resource_name
+        self.poll_interval_s = poll_interval_s
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    @staticmethod
+    def _configure_resource(inst):
+        inst.timeout = 1500
+        inst.write_termination = "\n"
+        inst.read_termination = "\n"
+
+    def _open_sdm3045x(self, rm):
+        if self.resource_name:
+            candidates = [self.resource_name]
+        else:
+            candidates = [
+                resource
+                for resource in rm.list_resources()
+                if str(resource).upper().startswith("USB")
+            ]
+
+        last_error = None
+        for resource in candidates:
+            inst = None
+            try:
+                inst = rm.open_resource(resource)
+                self._configure_resource(inst)
+                idn = inst.query("*IDN?").strip()
+                if "SIGLENT" in idn.upper() and "SDM3045X" in idn.upper():
+                    return inst, resource, idn
+                inst.close()
+            except Exception as exc:
+                last_error = exc
+                if inst is not None:
+                    try:
+                        inst.close()
+                    except Exception:
+                        pass
+
+        if last_error is not None:
+            raise RuntimeError(f"No se encontro el SDM3045X por VISA: {last_error}")
+        raise RuntimeError("No se encontro ningun recurso USB VISA para el SDM3045X.")
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        rm = None
+        inst = None
+        try:
+            import pyvisa
+
+            rm = pyvisa.ResourceManager()
+            inst, _resource, _idn = self._open_sdm3045x(rm)
+            self.status_changed.emit("DMM connected")
+
+            inst.write("*CLS")
+            inst.write("CONF:CURR:DC 10")
+            inst.write("CURR:DC:RANG 10")
+            inst.write("CURR:DC:RANG:AUTO OFF")
+            inst.write("CURR:DC:NPLC 0.3")
+            inst.write("SAMP:COUN 1")
+            inst.write("TRIG:SOUR IMM")
+            self.status_changed.emit("DMM ready")
+
+            sample_id = 0
+            while not self._stop_requested:
+                loop_start = monotonic()
+                raw = inst.query("READ?").strip().split(",")[0]
+                value = float(raw)
+                sample_id += 1
+                self.sample_ready.emit(value, monotonic(), sample_id)
+
+                remaining = self.poll_interval_s - (monotonic() - loop_start)
+                while remaining > 0 and not self._stop_requested:
+                    nap = min(remaining, 0.01)
+                    sleep(nap)
+                    remaining -= nap
+        except Exception as exc:
+            if not self._stop_requested:
+                self.error.emit(str(exc))
+        finally:
+            if inst is not None:
+                try:
+                    inst.close()
+                except Exception:
+                    pass
+            if rm is not None:
+                try:
+                    rm.close()
+                except Exception:
+                    pass
+            self.finished.emit()
 
 class ControlPlotDialog(QDialog):
     """
@@ -1939,6 +2041,27 @@ class MyDialog(QtWidgets.QDialog):
         self.automaticinput.toggled.connect(self._on_reference_source_changed)
 
         self.saveValuesCheckBox.toggled.connect(self._on_save_values_toggled)
+        self._dmm_thread = None
+        self._dmm_worker = None
+        self._dmm_stop_requested = False
+        self._dmm_latest_current_a = None
+        self._dmm_latest_time = None
+        self._dmm_latest_sample_id = -1
+        self._recording_include_dmm = False
+        self._recording_start_monotonic = None
+        self._dmmout_widget = self.findChild(QtWidgets.QLineEdit, "DMMout")
+        if self._dmmout_widget is not None:
+            self._dmmout_widget.setReadOnly(True)
+            self._dmmout_widget.setText("DMM off")
+        if hasattr(self, "DMMSync"):
+            self.DMMSync.toggled.connect(self._on_dmm_sync_toggled)
+
+        self._test_duration_timer = QTimer(self)
+        self._test_duration_timer.setSingleShot(True)
+        self._test_duration_timer.timeout.connect(self._on_test_duration_elapsed)
+        if hasattr(self, "time_delimited") and hasattr(self, "test_time"):
+            self.time_delimited.toggled.connect(self._on_time_delimited_toggled)
+            self._on_time_delimited_toggled(self.time_delimited.isChecked())
 
         self.grupo_identificationdata = QButtonGroup(self)
         self.grupo_identificationdata.addButton(self.identdatagraph, 1)
@@ -2326,6 +2449,135 @@ class MyDialog(QtWidgets.QDialog):
 
     def _on_save_values_toggled(self, checked):
         self.header_written = False
+        self._recording_include_dmm = False
+        self._recording_start_monotonic = None
+
+    def _on_time_delimited_toggled(self, checked):
+        if hasattr(self, "test_time"):
+            self.test_time.setEnabled(checked)
+        if hasattr(self, "test_time_label"):
+            self.test_time_label.setEnabled(checked)
+        if not checked:
+            self._test_duration_timer.stop()
+
+    def _test_duration_ms(self):
+        text = self.test_time.text().strip().replace(",", ".")
+        try:
+            duration_s = float(text)
+        except ValueError:
+            duration_s = float("nan")
+
+        max_duration_s = (2**31 - 1) / 1000.0
+        if not np.isfinite(duration_s) or duration_s <= 0 or duration_s > max_duration_s:
+            QMessageBox.warning(
+                self,
+                "Invalid test time",
+                "Test time must be a positive number of seconds.",
+            )
+            self.test_time.setFocus()
+            return None
+
+        return max(1, int(round(duration_s * 1000.0)))
+
+    def _on_test_duration_elapsed(self):
+        if self.isRunning:
+            self.isRunning = False
+            self.StartStop.setText("Start")
+            self.StopAction()
+        if self.saveValuesCheckBox.isChecked():
+            self.saveValuesCheckBox.setChecked(False)
+
+    def _set_dmm_output(self, text):
+        if getattr(self, "_dmmout_widget", None) is not None:
+            self._dmmout_widget.setText(text)
+
+    def _dmm_requested(self):
+        return bool(hasattr(self, "DMMSync") and self.DMMSync.isChecked())
+
+    def _on_dmm_sync_toggled(self, checked):
+        if checked:
+            self._start_dmm_worker()
+        else:
+            self._stop_dmm_worker(wait=False)
+            self._set_dmm_output("DMM off")
+
+    def _start_dmm_worker(self):
+        if self._dmm_thread is not None:
+            return
+
+        self._dmm_latest_current_a = None
+        self._dmm_latest_time = None
+        self._dmm_latest_sample_id = -1
+        self._dmm_stop_requested = False
+        self._set_dmm_output("Connecting DMM...")
+
+        resource_name = os.environ.get("OPENMCT_DMM_RESOURCE")
+        self._dmm_thread = QtCore.QThread(self)
+        self._dmm_worker = SiglentDMMWorker(resource_name=resource_name)
+        self._dmm_worker.moveToThread(self._dmm_thread)
+
+        self._dmm_thread.started.connect(self._dmm_worker.run)
+        self._dmm_worker.sample_ready.connect(self._on_dmm_sample_ready)
+        self._dmm_worker.status_changed.connect(self._on_dmm_status_changed)
+        self._dmm_worker.error.connect(self._on_dmm_error)
+        self._dmm_worker.finished.connect(self._dmm_thread.quit)
+        self._dmm_worker.finished.connect(self._dmm_worker.deleteLater)
+        self._dmm_thread.finished.connect(self._on_dmm_thread_finished)
+        self._dmm_thread.finished.connect(self._dmm_thread.deleteLater)
+        self._dmm_thread.start()
+
+    def _stop_dmm_worker(self, wait=False):
+        self._dmm_stop_requested = True
+        if self._dmm_worker is not None:
+            self._dmm_worker.stop()
+        if wait and self._dmm_thread is not None:
+            if not self._dmm_thread.wait(2500):
+                print("DMM worker did not stop before timeout.")
+
+    def _on_dmm_thread_finished(self):
+        self._dmm_thread = None
+        self._dmm_worker = None
+        if not self._dmm_stop_requested and hasattr(self, "DMMSync"):
+            self.DMMSync.blockSignals(True)
+            self.DMMSync.setChecked(False)
+            self.DMMSync.blockSignals(False)
+
+    def _on_dmm_status_changed(self, message):
+        self._set_dmm_output(message)
+
+    def _on_dmm_error(self, message):
+        self._set_dmm_output(f"DMM error: {message}")
+
+    def _on_dmm_sample_ready(self, current_a, sample_time, sample_id):
+        self._dmm_latest_current_a = current_a
+        self._dmm_latest_time = sample_time
+        self._dmm_latest_sample_id = sample_id
+        self._set_dmm_output(f"{current_a:.9g} A")
+
+    @staticmethod
+    def _dmm_columns_header():
+        return ",DMM_CURRENT_A,DMM_TIME_s,DMM_AGE_ms,DMM_SAMPLE_ID"
+
+    def _dmm_row_suffix(self):
+        if not self._recording_include_dmm:
+            return ""
+        if (
+            self._recording_start_monotonic is None
+            or not self._dmm_requested()
+            or self._dmm_latest_current_a is None
+            or self._dmm_latest_time is None
+            or self._dmm_latest_time < self._recording_start_monotonic
+        ):
+            return ",nan,nan,nan,-1"
+
+        dmm_time_s = self._dmm_latest_time - self._recording_start_monotonic
+        dmm_age_ms = (monotonic() - self._dmm_latest_time) * 1000.0
+        return (
+            f",{self._dmm_latest_current_a:.9g}"
+            f",{dmm_time_s:.6f}"
+            f",{dmm_age_ms:.1f}"
+            f",{self._dmm_latest_sample_id}"
+        )
 
     def _runtime_plot_widgets(self):
         return (self.graphWidgetRPM, self.graphWidgetPWM)
@@ -4053,13 +4305,21 @@ class MyDialog(QtWidgets.QDialog):
 
     def toggleStartStop(self):
         if self.isRunning:
+            self._test_duration_timer.stop()
             self.isRunning = False
             self.StartStop.setText("Start")
             self.StopAction()
         else:
+            duration_ms = None
+            if hasattr(self, "time_delimited") and self.time_delimited.isChecked():
+                duration_ms = self._test_duration_ms()
+                if duration_ms is None:
+                    return
             self.isRunning = True
             self.StartStop.setText("Stop")
             self.StartAction()
+            if duration_ms is not None:
+                self._test_duration_timer.start(duration_ms)
 
     def _estimate_static_gain(self, u, y):
         u = np.asarray(u, dtype=float).ravel()
@@ -4328,19 +4588,11 @@ class MyDialog(QtWidgets.QDialog):
                 self._try_reconnect_serial()
                 return
 
-            # Create file header once when saving is enabled
-            if self.saveValuesCheckBox.isChecked() and not getattr(self, "header_written", False):
-                from datetime import datetime
-                mode_text = self.modooperacion.currentText()
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                header = f"Mode: {mode_text}\nDate: {now}\nREF,MEAS,DT_ms,CURR,PWM\n"
-                os.makedirs("data", exist_ok=True)              # <-- crea la carpeta si no existe
-                filepath = os.path.join("data", "data.txt")     # <-- ruta dentro de /data
-                with open(filepath, 'w', newline='') as f:
-                    f.write(header)
-                self.header_written = True
-            elif not self.saveValuesCheckBox.isChecked():
+            # Reset file header state when saving is disabled.
+            if not self.saveValuesCheckBox.isChecked():
                 self.header_written = False
+                self._recording_include_dmm = False
+                self._recording_start_monotonic = None
 
             # Read & process all available lines
             try:
@@ -4365,7 +4617,11 @@ class MyDialog(QtWidgets.QDialog):
                 if len(vals) < 5:
                     continue
 
-                sp, meas, dt_ms, curr, pwm = vals[0], vals[1], vals[2], vals[3], vals[-1]
+                has_current_avg = len(vals) >= 6
+                sp, meas, dt_ms = vals[0], vals[1], vals[2]
+                raw_current = vals[3]
+                current_avg = vals[4] if has_current_avg else None
+                pwm = vals[-1]
 
                 # Append to buffers (all with the same maxlen)
                 self.dataRPM_setpoint.append(sp)
@@ -4376,8 +4632,34 @@ class MyDialog(QtWidgets.QDialog):
                 # Save this sample if requested
                 if self.saveValuesCheckBox.isChecked():
                     filepath = os.path.join("data", "data.txt")
+                    os.makedirs("data", exist_ok=True)
+                    if not getattr(self, "header_written", False):
+                        mode_text = self.modooperacion.currentText()
+                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self._recording_include_dmm = self._dmm_requested()
+                        self._recording_start_monotonic = monotonic()
+                        dmm_columns = self._dmm_columns_header() if self._recording_include_dmm else ""
+                        if has_current_avg:
+                            columns = f"REF,MEAS,DT_ms,CURRENT_RAW,CURRENT_AVG,PWM{dmm_columns}"
+                        else:
+                            columns = f"REF,MEAS,DT_ms,CURR,PWM{dmm_columns}"
+                        header = f"Mode: {mode_text}\nDate: {now}\n{columns}\n"
+                        with open(filepath, 'w', newline='') as f:
+                            f.write(header)
+                        self.header_written = True
+
                     with open(filepath, 'a', newline='') as f:
-                        f.write(f"{int(sp)},{int(meas)},{int(dt_ms)},{curr:.2f},{int(pwm)}\n")
+                        dmm_suffix = self._dmm_row_suffix()
+                        if has_current_avg:
+                            f.write(
+                                f"{int(sp)},{int(meas)},{dt_ms:.3f},"
+                                f"{raw_current:.2f},{current_avg:.2f},{int(pwm)}{dmm_suffix}\n"
+                            )
+                        else:
+                            f.write(
+                                f"{int(sp)},{int(meas)},{dt_ms:.3f},"
+                                f"{raw_current:.2f},{int(pwm)}{dmm_suffix}\n"
+                            )
 
             # ----- Plot latest window (equal-length slices) -----
             N = min(len(self.dataDT), len(self.dataRPM_setpoint), len(self.dataRPM_measured), len(self.dataPWM))
@@ -4437,6 +4719,8 @@ class MyDialog(QtWidgets.QDialog):
 
     def closeEvent(self, event):
         try:
+            self._test_duration_timer.stop()
+            self._stop_dmm_worker(wait=True)
             self.StartStop.setText("Start")
             self.isRunning = False
             if self.serial_port is not None and (not hasattr(self.serial_port, "is_open") or self.serial_port.is_open):

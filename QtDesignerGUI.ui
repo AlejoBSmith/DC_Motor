@@ -107,10 +107,10 @@
   <widget class="QPushButton" name="StartStop">
    <property name="geometry">
     <rect>
-     <x>645</x>
+     <x>765</x>
      <y>485</y>
      <width>136</width>
-     <height>86</height>
+     <height>66</height>
     </rect>
    </property>
    <property name="font">
@@ -167,26 +167,6 @@
     <string>Operating mode</string>
    </property>
   </widget>
-  <widget class="QLineEdit" name="serial_in">
-   <property name="geometry">
-    <rect>
-     <x>10</x>
-     <y>500</y>
-     <width>626</width>
-     <height>21</height>
-    </rect>
-   </property>
-  </widget>
-  <widget class="QLineEdit" name="serial_out">
-   <property name="geometry">
-    <rect>
-     <x>10</x>
-     <y>550</y>
-     <width>626</width>
-     <height>21</height>
-    </rect>
-   </property>
-  </widget>
   <widget class="QTabWidget" name="tabWidget">
    <property name="geometry">
     <rect>
@@ -200,7 +180,7 @@
     <enum>QTabWidget::North</enum>
    </property>
    <property name="currentIndex">
-    <number>10</number>
+    <number>11</number>
    </property>
    <property name="iconSize">
     <size>
@@ -2695,6 +2675,47 @@ p, li { white-space: pre-wrap; }
      </property>
     </widget>
    </widget>
+   <widget class="QWidget" name="tab_11">
+    <attribute name="title">
+     <string>Siglent DMM</string>
+    </attribute>
+    <widget class="QCheckBox" name="DMMSync">
+     <property name="geometry">
+      <rect>
+       <x>40</x>
+       <y>50</y>
+       <width>186</width>
+       <height>31</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Connect to Siglent SDM3045X</string>
+     </property>
+    </widget>
+    <widget class="QLineEdit" name="DMMout">
+     <property name="geometry">
+      <rect>
+       <x>40</x>
+       <y>90</y>
+       <width>146</width>
+       <height>20</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QLabel" name="DMMout_label">
+     <property name="geometry">
+      <rect>
+       <x>195</x>
+       <y>85</y>
+       <width>101</width>
+       <height>26</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>DMM Output</string>
+     </property>
+    </widget>
+   </widget>
   </widget>
   <widget class="QLabel" name="slider_label">
    <property name="geometry">
@@ -2712,10 +2733,10 @@ p, li { white-space: pre-wrap; }
   <widget class="QPushButton" name="update_parameters">
    <property name="geometry">
     <rect>
-     <x>800</x>
+     <x>915</x>
      <y>485</y>
      <width>161</width>
-     <height>86</height>
+     <height>66</height>
     </rect>
    </property>
    <property name="text">
@@ -2886,9 +2907,9 @@ p, li { white-space: pre-wrap; }
   <widget class="QLabel" name="datapoints_label_2">
    <property name="geometry">
     <rect>
-     <x>10</x>
-     <y>480</y>
-     <width>331</width>
+     <x>11</x>
+     <y>476</y>
+     <width>256</width>
      <height>21</height>
     </rect>
    </property>
@@ -2900,8 +2921,8 @@ p, li { white-space: pre-wrap; }
    <property name="geometry">
     <rect>
      <x>10</x>
-     <y>530</y>
-     <width>351</width>
+     <y>520</y>
+     <width>251</width>
      <height>21</height>
     </rect>
    </property>
@@ -3269,6 +3290,59 @@ p, li { white-space: pre-wrap; }
      <string>Automatic reference signal</string>
     </property>
    </widget>
+  </widget>
+  <widget class="QWidget" name="">
+   <property name="geometry">
+    <rect>
+     <x>765</x>
+     <y>555</y>
+     <width>311</width>
+     <height>31</height>
+    </rect>
+   </property>
+   <layout class="QHBoxLayout" name="horizontalLayout">
+    <item>
+     <widget class="QCheckBox" name="time_delimited">
+      <property name="text">
+       <string>Time-delimited test</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="test_time_label">
+      <property name="text">
+       <string>Test time (s)</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLineEdit" name="test_time">
+      <property name="text">
+       <string>Test time</string>
+      </property>
+     </widget>
+    </item>
+   </layout>
+  </widget>
+  <widget class="QLineEdit" name="serial_in">
+   <property name="geometry">
+    <rect>
+     <x>10</x>
+     <y>497</y>
+     <width>626</width>
+     <height>19</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QLineEdit" name="serial_out">
+   <property name="geometry">
+    <rect>
+     <x>10</x>
+     <y>545</y>
+     <width>626</width>
+     <height>19</height>
+    </rect>
+   </property>
   </widget>
  </widget>
  <resources/>

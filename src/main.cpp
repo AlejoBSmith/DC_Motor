@@ -76,10 +76,10 @@ struct SystemVariables {
 struct TimingData {
   unsigned long tiempo = 0;
   unsigned long tiempoinicio = 0;
-  unsigned long tiempoanterior = micros();
-  unsigned long tiemporestart = 0;
+  uint32_t tiempoanterior_us = micros();
+  uint32_t tiemporestart_us = micros();
+  uint32_t tiempociclo_us = 0;
   float tiempociclo = 0;
-  float tiempoloop = 0;
   unsigned long int tiemporeferencia = 2000;
   int delayintencional = 10;
 };
@@ -98,6 +98,7 @@ struct SerialData {
 struct MeasurementsData {
   float RPM = 0;
   float RPMPromedio = 0;
+  float rawcurrent = 0;
   float current = 0;
   float currentMedian = 0;
   float currentAvgAux = 0;
@@ -156,10 +157,13 @@ void resetControllerMemory() {
 }
 
 void inicializaVariables() {
+  const uint32_t now_us = micros();
   sys.referencia = 0;
   sys.medicion = 0;
   timing.tiempo = 0;
-  timing.tiempoanterior = 0;
+  timing.tiempoanterior_us = now_us;
+  timing.tiemporestart_us = now_us;
+  timing.tiempociclo_us = 0;
   timing.tiempociclo = 0;
   enc.encoderTicks = 0;
   enc.lastEncoded = 0;
@@ -488,16 +492,16 @@ void loop() {
       sys.tiporef = sys.tiporef ? 1 : 0;
 
       inicializaVariables();
-      timing.tiemporestart = micros() / 1000UL;
     }
   }
 
-  timing.tiempoanterior      = timing.tiempo;
-  timing.tiempo              = micros() / 1000.0f - timing.tiemporestart;
-  timing.tiempoloop         = timing.tiempo-timing.tiempoanterior;
-  timing.tiempociclo += timing.tiempoloop;
+  const uint32_t now_us = micros();
+  timing.tiempo = (now_us - timing.tiemporestart_us) / 1000UL;
+  timing.tiempociclo_us += now_us - timing.tiempoanterior_us;
+  timing.tiempoanterior_us = now_us;
 
-  if (timing.tiempociclo >= timing.delayintencional) { //Para bajar el jitter, se elimina el delay() e implementa esto
+  if (timing.tiempociclo_us >= (uint32_t)timing.delayintencional * 1000UL) { //Para bajar el jitter, se elimina el delay() e implementa esto
+    timing.tiempociclo = timing.tiempociclo_us / 1000.0f;
     if (sys.inicio == 1) {
       switch (sys.modooperacion) {
         case 0: // Inhabilitado
@@ -601,15 +605,17 @@ void loop() {
       }
 
       #ifdef USE_TEENSY
-        meas.current = 1.186*analogRead(A5)-1.45; // ecuación de calibración
+        meas.rawcurrent = analogRead(A5);
+        meas.current = 1.186*meas.rawcurrent-1.45; // ecuación de calibración
         meas.current = constrain(meas.current,0.0f,2000.0f);
         meas.currentMedian = FilteredCurrentMedian.reading(meas.current);
         meas.currentAvgAux = FilteredCurrent.reading(meas.currentMedian);
         meas.currentAvg = FilteredCurrent2.reading(meas.currentAvgAux);
-        Serial.printf("%d %d %d %.2f %d\n",
+        Serial.printf("%d %d %.3f %.2f %.2f %d\n",
                       (int)sys.referencia,
                       (int)sys.medicion,
-                      (int)timing.tiempociclo,
+                      (double)timing.tiempociclo,
+                      (float)meas.rawcurrent,
                       (float)meas.currentAvg,   // no usado aún en la GUI
                       (int)ctrl.PWMOUT);
       #endif
@@ -620,7 +626,7 @@ void loop() {
         Serial.print(" ");
         Serial.print(int(sys.medicion));
         Serial.print(" ");
-        Serial.print(int(timing.tiempociclo));
+        Serial.print(timing.tiempociclo, 3);
         Serial.print(" ");
         Serial.print((int)meas.current);
         Serial.print(" ");
@@ -632,6 +638,7 @@ void loop() {
       analogWrite(pins.pwmPin, 0);
       delay(10);
     }
-    timing.tiempociclo= 0;
+    timing.tiempociclo_us = 0;
+    timing.tiempociclo = 0;
   }
 }
