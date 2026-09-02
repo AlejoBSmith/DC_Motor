@@ -606,7 +606,7 @@ void loop() {
 
       #ifdef USE_TEENSY
         meas.rawcurrent = analogRead(A5);
-        meas.current = 1.272*meas.rawcurrent-0.04853; // ecuación de calibración
+        meas.current = 1.225866*meas.rawcurrent-3.861405; // ecuación de calibración
         meas.current = constrain(meas.current,0.0f,5000.0f);
         meas.currentMedian = FilteredCurrentMedian.reading(meas.current);
         meas.currentAvgAux = FilteredCurrent.reading(meas.currentMedian);
