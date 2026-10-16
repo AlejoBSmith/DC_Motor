@@ -2094,6 +2094,15 @@ class MyDialog(QtWidgets.QDialog):
 
         # Realiza la discretización
         self.discretize.clicked.connect(self.discretize_function)
+        self.prewarp_frequency.setPlaceholderText("10 rad/s")
+        self.prewarp_frequency.setToolTip(
+            "Frequency in rad/s where Tustin matches the continuous response. "
+            "Use 0 < frequency < pi/Ts; e.g. 10 rad/s."
+        )
+        self.prewarp_tustin.setToolTip("Apply frequency prewarping with the bilinear method.")
+        self.method.currentTextChanged.connect(self._update_prewarp_controls)
+        self.prewarp_tustin.toggled.connect(self._update_prewarp_controls)
+        self._update_prewarp_controls()
 
         # Define botón de update parameters
         self.update_parameters.clicked.connect(self._on_update_parameters_clicked)
@@ -3957,6 +3966,11 @@ class MyDialog(QtWidgets.QDialog):
             if hasattr(self, "tuner_status"):
                 self.tuner_status.setText(f"PID tuner error: {e}")
 
+    def _update_prewarp_controls(self, *_):
+        is_bilinear = self.method.currentText() == "bilinear"
+        self.prewarp_tustin.setEnabled(is_bilinear)
+        self.prewarp_frequency.setEnabled(is_bilinear and self.prewarp_tustin.isChecked())
+
     def discretize_function(self):
 
         def _strip_leading_zeros(coefs, eps=1e-12):
@@ -3994,16 +4008,31 @@ class MyDialog(QtWidgets.QDialog):
                 float(self.sden0.text() or 0),
             ]
             T_s = self._line_edit_float(self.sampling_time, default=0.02)
-            if T_s <= 0:
-                raise ValueError("Sampling time must be greater than zero.")
+            if not np.isfinite(T_s) or T_s <= 0:
+                raise ValueError("Sampling time must be finite and greater than zero.")
             method = self.method.currentText()  # e.g., 'zoh', 'foh', 'bilinear' (tustin)
+            prewarp_frequency = None
+            discretization_dt = T_s
+            if method == "bilinear" and self.prewarp_tustin.isChecked():
+                try:
+                    prewarp_frequency = float(self.prewarp_frequency.text().strip().replace(",", "."))
+                except ValueError:
+                    raise ValueError("Enter a numeric prewarp frequency in rad/s.") from None
+                if not np.isfinite(prewarp_frequency) or not 0 < prewarp_frequency < np.pi / T_s:
+                    raise ValueError(
+                        f"Prewarp frequency must be finite and satisfy 0 < frequency < {np.pi / T_s:g} rad/s (Nyquist)."
+                    )
+                # Effective Tustin step: 2/dt = wp/tan(wp*Ts/2).
+                # The actual sampling period remains T_s.
+                half_angle = prewarp_frequency * T_s / 2
+                discretization_dt = T_s * (np.tan(half_angle) / half_angle if half_angle else 1.0)
 
             # Clean leading zeros (highest powers)
             num = _strip_leading_zeros(num)
             den = _strip_leading_zeros(den)
 
             # Discretize (SciPy returns TF in z^-1)
-            num_z, den_z, _ = cont2discrete((num, den), T_s, method)
+            num_z, den_z, _ = cont2discrete((num, den), discretization_dt, method)
             num_z = np.ravel(num_z).astype(float)
             den_z = np.ravel(den_z).astype(float)
 
@@ -4028,6 +4057,8 @@ class MyDialog(QtWidgets.QDialog):
                 f"{den_s}\n"
                 f"Ts = {T_s:g} s"
             )
+            if prewarp_frequency is not None:
+                result += f"\nPrewarp = {prewarp_frequency:g} rad/s"
 
             # Use plain text if available (keeps line breaks reliably)
             if hasattr(self.discretizationresult, "setPlainText"):
