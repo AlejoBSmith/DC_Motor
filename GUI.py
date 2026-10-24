@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from scipy.optimize import least_squares, minimize
+from scipy.optimize import least_squares, minimize, minimize_scalar
 from scipy.signal import cont2discrete
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -62,6 +62,125 @@ def plot_root_locus_clean(sys, ax):
             category=UserWarning,
         )
         return ctrl.root_locus_plot(sys, ax=ax, grid=False, interactive=False)
+
+
+def tf_num_den(sys):
+    """Return numerator and denominator coefficients (descending powers)."""
+    num = np.asarray(sys.num[0][0], dtype=float).ravel()
+    den = np.asarray(sys.den[0][0], dtype=float).ravel()
+    return num, den
+
+
+def closed_loop_poles(sys, K):
+    """
+    Closed-loop poles of 1 + K*sys = 0 (unity negative feedback).
+
+    Evaluated straight from the characteristic polynomial (den + K*num) instead
+    of building a feedback() system every time, which is much faster and works
+    the same for continuous (s) and discrete (z) transfer functions.
+    """
+    num, den = tf_num_den(sys)
+    n = max(len(num), len(den))
+    num = np.pad(num, (n - len(num), 0))
+    den = np.pad(den, (n - len(den), 0))
+    poly = den + float(K) * num
+
+    nonzero = np.nonzero(np.abs(poly) > 1e-14)[0]
+    if nonzero.size == 0:
+        return np.array([], dtype=complex)
+    poly = poly[nonzero[0]:]
+    if poly.size <= 1:
+        return np.array([], dtype=complex)
+    return np.roots(poly)
+
+
+def locus_gain_from_point(sys, point, k_seed=None):
+    """
+    Gain K whose closed-loop pole is closest to `point` in the s/z plane.
+
+    python-control samples the locus on a coarse gain grid (about 72 points by
+    default), so selecting the nearest sample makes K jump in big steps. Here
+    the gain is refined continuously with a bounded 1-D search on log(K), which
+    turns a click (or a zoomed click) on a branch into a fine gain value.
+    """
+    point = complex(point)
+    num, den = tf_num_den(sys)
+
+    def distance(K):
+        poles = closed_loop_poles(sys, K)
+        if poles.size == 0:
+            return np.inf
+        return float(np.min(np.abs(poles - point)))
+
+    seed = None
+    try:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            loop_value = np.polyval(num, point) / np.polyval(den, point)
+        if np.isfinite(loop_value) and abs(loop_value) > 0:
+            seed = 1.0 / abs(loop_value)   # magnitude condition |K*L(s)| = 1
+    except Exception:
+        seed = None
+
+    if k_seed is not None:
+        try:
+            k_seed = float(k_seed)
+            if np.isfinite(k_seed) and k_seed > 0:
+                seed = k_seed
+        except (TypeError, ValueError):
+            pass
+
+    if seed is None or not np.isfinite(seed) or seed <= 0:
+        seed = 1.0
+    seed = max(float(seed), 1e-12)
+
+    result = minimize_scalar(
+        lambda log_k: distance(np.exp(log_k)),
+        bounds=(np.log(seed) - 12.0, np.log(seed) + 12.0),
+        method="bounded",
+        options={"xatol": 1e-7, "maxiter": 200},
+    )
+    return float(np.exp(result.x))
+
+
+def k_slider_pos(K, kmin, kmax, steps=1000):
+    """Map a gain to a slider position in [0, steps] with logarithmic spacing."""
+    try:
+        K = float(K)
+    except (TypeError, ValueError):
+        return 0
+    kmin = max(float(kmin), 1e-15)
+    kmax = max(float(kmax), kmin * 10.0)
+    if not np.isfinite(K) or K <= 0:
+        return 0
+    frac = np.log(K / kmin) / np.log(kmax / kmin)
+    return int(round(float(np.clip(frac, 0.0, 1.0)) * steps))
+
+
+def k_from_slider_pos(pos, kmin, kmax, steps=1000):
+    """Inverse of k_slider_pos: slider position -> gain (0 at position 0)."""
+    if pos <= 0:
+        return 0.0
+    kmin = max(float(kmin), 1e-15)
+    kmax = max(float(kmax), kmin * 10.0)
+    frac = float(np.clip(pos, 0, steps)) / steps
+    return float(kmin * (kmax / kmin) ** frac)
+
+
+def design_state_key(prefix, sys, extra=()):
+    """
+    Key that identifies a plant/design tab, so a controller design can be
+    restored only while the underlying transfer function is unchanged.
+    """
+    num, den = tf_num_den(sys)
+    return (
+        prefix,
+        len(num),
+        len(den),
+        *np.round(num, 12).tolist(),
+        *np.round(den, 12).tolist(),
+        *tuple(extra),
+    )
+
 
 class SiglentDMMWorker(QtCore.QObject):
     sample_ready = QtCore.pyqtSignal(float, float, int)
@@ -173,7 +292,7 @@ class ControlPlotDialog(QDialog):
       - Click on locus => updates BOTH info + step plot
     """
 
-    def __init__(self, parent, sys):
+    def __init__(self, parent, sys, state=None):
         super().__init__(parent)
         self.setWindowTitle("Root locus (large)")
         self.resize(1400, 850)
@@ -195,6 +314,22 @@ class ControlPlotDialog(QDialog):
         self.comp_czero_pairs = []
         self.comp_cpole_pairs = []
 
+        # Design state carried over from a previous time this window was open
+        # (compensator + selected gain), so closing it does not throw the tuning away.
+        state = state or {}
+        self.comp_zeros = list(state.get("comp_zeros", []))
+        self.comp_poles = list(state.get("comp_poles", []))
+        self.comp_czero_pairs = [tuple(v) for v in state.get("comp_czero_pairs", [])]
+        self.comp_cpole_pairs = [tuple(v) for v in state.get("comp_cpole_pairs", [])]
+        self.comp_integrators = int(state.get("comp_integrators", 0))
+        self.comp_origin_zeros = int(state.get("comp_origin_zeros", 0))
+        self.comp_history = list(state.get("comp_history", []))
+
+        self.selected_k = float(state.get("selected_k", 0.0) or 0.0)
+        self.selected_pole = None
+        self._sel_artists = []
+        self._view_lims = None
+
         # ---- Figure: 2 rows (RL on top, Step on bottom) ----
         self.fig = Figure(constrained_layout=True)
         self.ax_rl = self.fig.add_subplot(211)
@@ -202,9 +337,31 @@ class ControlPlotDialog(QDialog):
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
 
+        # Grid refresh state: the damping grid depends on the visible limits.
+        self._grid_artists = []
+        self._suppress_grid_events = False
+        self._grid_timer = QTimer(self)
+        self._grid_timer.setSingleShot(True)
+        self._grid_timer.setInterval(40)
+        self._grid_timer.timeout.connect(self._redraw_grid)
+        self.ax_rl.callbacks.connect("xlim_changed", self._on_view_limits_changed)
+        self.ax_rl.callbacks.connect("ylim_changed", self._on_view_limits_changed)
+
         # ---- Right side info ----
         self.info = QTextEdit()
         self.info.setReadOnly(True)
+
+        # ---- Gain controls ----
+        self.k_label = QLabel("Gain K")
+        self.k_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.k_slider.setRange(0, 1000)
+        self.k_slider.setToolTip(
+            "Logarithmic gain slider (0 = open loop).\n"
+            "It follows the value selected with a click on the locus."
+        )
+        self.k_value = QtWidgets.QLineEdit()
+        self.k_value.setPlaceholderText("Click the locus or type K")
+        self.k_value.setToolTip("Type an exact gain and press Enter.")
 
         # ---- Compensator builder widgets ----
         self.comp_title = QLabel("Compensator C(s)")
@@ -229,7 +386,8 @@ class ControlPlotDialog(QDialog):
 
         self.comp_display = QTextEdit()
         self.comp_display.setReadOnly(True)
-        self.comp_display.setMaximumHeight(140)
+        self.comp_display.setMinimumHeight(80)
+        self.comp_display.setMaximumHeight(120)
 
         # ---- Layout ----
         main = QHBoxLayout(self)
@@ -247,7 +405,15 @@ class ControlPlotDialog(QDialog):
         info_group = QGroupBox("Design info")
         info_group_layout = QVBoxLayout(info_group)
         info_group_layout.setContentsMargins(8, 8, 8, 8)
-        info_group_layout.addWidget(self.info)
+
+        k_row = QHBoxLayout()
+        k_row.setContentsMargins(0, 0, 0, 0)
+        k_row.setSpacing(8)
+        k_row.addWidget(self.k_label, 0)
+        k_row.addWidget(self.k_slider, 1)
+        k_row.addWidget(self.k_value, 0)
+        info_group_layout.addLayout(k_row)
+        info_group_layout.addWidget(self.info, 1)
 
         comp_group = QGroupBox("Compensator C(s)")
         comp_group_layout = QVBoxLayout(comp_group)
@@ -267,34 +433,39 @@ class ControlPlotDialog(QDialog):
         comp_group_layout.addLayout(btn_row)
 
         comp_group_layout.addWidget(self.comp_display)
-        self.info.setMinimumHeight(260)
-        self.comp_display.setMinimumHeight(180)
 
-        right_layout.addWidget(info_group, 3)
-        right_layout.addWidget(comp_group, 2)
+        self.info.setMinimumHeight(240)
+        self.info.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        right_layout.addWidget(info_group, 1)
+        right_layout.addWidget(comp_group, 0)
         main.addWidget(right, 2)
+
+        self.setMinimumSize(1000, 650)
 
         # Root locus picking state
         self._rlist = None
         self._klist = None
-        self._hl_artist = None
 
         # Connect buttons
         self.comp_add_btn.clicked.connect(self._add_compensator_element)
         self.comp_undo_btn.clicked.connect(self._undo_compensator_element)
         self.comp_clear_btn.clicked.connect(self._clear_compensator)
         self.comp_type.currentIndexChanged.connect(self._update_comp_input_visibility)
+        self.k_slider.valueChanged.connect(self._on_k_slider_changed)
+        self.k_value.editingFinished.connect(self._on_k_edit_finished)
 
         # Initial plots
         self._rebuild_compensated_system()
         self._plot_root_locus_initial()
-        self._plot_step_for_K(K=0.0)
-        self._set_info_idle()
         self._update_comp_display()
         self._update_comp_input_visibility()
+        self._set_k_display(self.selected_k)
+        self._apply_gain(self.selected_k)
 
-        # Connect click picking
+        # Connect click picking and zooming
         self.canvas.mpl_connect("button_press_event", self._on_click_rlocus)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
 
     # ---------- Compensator builder ----------
     def _build_compensator_tf(self):
@@ -459,9 +630,9 @@ class ControlPlotDialog(QDialog):
 
             self._rebuild_compensated_system()
             self._plot_root_locus_initial()
-            self._plot_step_for_K(0.0)
-            self._set_info_idle()
             self._update_comp_display()
+            self._set_k_display(self.selected_k)
+            self._apply_gain(self.selected_k)
 
         except Exception as e:
             self.comp_display.setText(f"Add error: {e}")
@@ -487,9 +658,9 @@ class ControlPlotDialog(QDialog):
 
         self._rebuild_compensated_system()
         self._plot_root_locus_initial()
-        self._plot_step_for_K(0.0)
-        self._set_info_idle()
         self._update_comp_display()
+        self._set_k_display(self.selected_k)
+        self._apply_gain(self.selected_k)
 
     def _clear_compensator(self):
         self.comp_zeros = []
@@ -502,37 +673,91 @@ class ControlPlotDialog(QDialog):
 
         self._rebuild_compensated_system()
         self._plot_root_locus_initial()
-        self._plot_step_for_K(0.0)
-        self._set_info_idle()
         self._update_comp_display()
+        self._set_k_display(self.selected_k)
+        self._apply_gain(self.selected_k)
 
     # ---------- Root locus ----------
     def _plot_root_locus_initial(self):
-        self.ax_rl.clear()
+        self._suppress_grid_events = True
+        try:
+            self.ax_rl.clear()
+            self._grid_artists = []
+            self._view_lims = None
+            self._sel_artists = []
 
-        rldata = ctrl.root_locus_map(self.sys)
-        self._rlist = np.asarray(rldata.loci)
-        self._klist = np.asarray(rldata.gains)
+            rldata = ctrl.root_locus_map(self.sys)
+            self._rlist = np.asarray(rldata.loci)
+            self._klist = np.asarray(rldata.gains)
 
-        plot_root_locus_clean(self.sys, self.ax_rl)
+            plot_root_locus_clean(self.sys, self.ax_rl)
 
-        xleft, _ = self.ax_rl.get_xlim()
-        self.ax_rl.set_xlim(xleft, 0.0)
+            xleft, _ = self.ax_rl.get_xlim()
+            self.ax_rl.set_xlim(xleft, 0.0)
 
-        ylow, yhigh = self.ax_rl.get_ylim()
-        ymax = max(abs(ylow), abs(yhigh), 1.0)
-        self.ax_rl.set_ylim(-ymax, ymax)
+            ylow, yhigh = self.ax_rl.get_ylim()
+            ymax = max(abs(ylow), abs(yhigh), 1.0)
+            self.ax_rl.set_ylim(-ymax, ymax)
 
-        if hasattr(self.parent(), "_overlay_sgrid"):
-            self.parent()._overlay_sgrid(self.ax_rl, show_labels=True)
+            self.ax_rl.set_title("")
+            self.ax_rl.set_xlabel("")
+            self.ax_rl.set_ylabel("")
+        finally:
+            self._suppress_grid_events = False
 
-        self.ax_rl.set_title("")
-        self.ax_rl.set_xlabel("")
-        self.ax_rl.set_ylabel("")
-
+        self._redraw_grid()
         self.canvas.draw_idle()
 
+    def _on_view_limits_changed(self, _ax=None):
+        if getattr(self, "_suppress_grid_events", False):
+            return
+        self._grid_timer.start()
+
+    def _redraw_grid(self):
+        """Remove and redraw the damping grid for the current visible limits."""
+        self._suppress_grid_events = True
+        try:
+            for artist in self._grid_artists:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+            self._grid_artists = []
+
+            parent = self.parent()
+            if hasattr(parent, "_overlay_sgrid"):
+                self._grid_artists = list(
+                    parent._overlay_sgrid(self.ax_rl, show_labels=True)
+                )
+        finally:
+            self._suppress_grid_events = False
+        self.canvas.draw_idle()
+
+    def _nearest_locus_seed(self, point):
+        """Gain of the closest sample in the coarse locus data (search seed)."""
+        if self._rlist is None or self._klist is None:
+            return None
+        try:
+            diffs = np.abs(self._rlist - point)
+            idx_flat = int(np.argmin(diffs))
+            ik, _ = np.unravel_index(idx_flat, diffs.shape)
+            return float(self._klist[ik])
+        except Exception:
+            return None
+
+    def _pixel_distance(self, p1, p2):
+        try:
+            x1, y1 = self.ax_rl.transData.transform((p1.real, p1.imag))
+            x2, y2 = self.ax_rl.transData.transform((p2.real, p2.imag))
+            return float(np.hypot(x1 - x2, y1 - y2))
+        except Exception:
+            return 0.0
+
     def _on_click_rlocus(self, event):
+        if getattr(self.toolbar, "mode", ""):
+            return   # pan/zoom tool active: let the toolbar handle the click
+        if getattr(event, "button", 1) != 1:
+            return
         if event.inaxes != self.ax_rl:
             return
         if event.xdata is None or event.ydata is None:
@@ -540,33 +765,161 @@ class ControlPlotDialog(QDialog):
         if self._rlist is None or self._klist is None:
             return
 
-        s_click = event.xdata + 1j * event.ydata
-        diffs = np.abs(self._rlist - s_click)
-        idx_flat = np.argmin(diffs)
-        ik, ip = np.unravel_index(idx_flat, diffs.shape)
+        s_click = complex(event.xdata, event.ydata)
+        seed = self._nearest_locus_seed(s_click)
+        try:
+            K = locus_gain_from_point(self.sys, s_click, k_seed=seed)
+        except Exception:
+            return
 
-        K = float(self._klist[ik])
-        pole = self._rlist[ik, ip]
+        poles = closed_loop_poles(self.sys, K)
+        if poles.size == 0:
+            return
+        pole = poles[int(np.argmin(np.abs(poles - s_click)))]
 
-        if self._hl_artist is not None:
+        # Ignore clicks that are not near any branch of the locus.
+        if self._pixel_distance(s_click, pole) > 30:
+            return
+
+        self._apply_gain(K, pole=pole)
+
+    def _apply_gain(self, K, pole=None):
+        """Set the loop gain, refresh the markers, the step response and info."""
+        try:
+            K = float(K)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(K) or K < 0:
+            return
+        if K < 1e-9:
+            K = 0.0
+
+        self.selected_k = K
+        self._set_k_display(K)
+
+        if K > 0:
+            poles = closed_loop_poles(self.sys, K)
+        else:
+            poles = np.asarray(ctrl.poles(self.sys), dtype=complex).ravel()
+
+        if poles.size:
+            if pole is None or not np.isfinite(pole):
+                pole = poles[int(np.argmax(np.asarray(poles).real))]
+            else:
+                pole = poles[int(np.argmin(np.abs(poles - complex(pole))))]
+        else:
+            pole = None
+        self.selected_pole = pole
+
+        for artist in self._sel_artists:
             try:
-                self._hl_artist.remove()
+                artist.remove()
             except Exception:
                 pass
+        self._sel_artists = []
 
-        self._hl_artist = self.ax_rl.plot(
-            [pole.real], [pole.imag],
-            marker="o",
-            markersize=8,
-            markerfacecolor="red",
-            markeredgecolor="red",
-            linestyle="None",
-            zorder=5
-        )[0]
+        for p in np.atleast_1d(poles):
+            if np.isfinite(p.real) and np.isfinite(p.imag):
+                self._sel_artists.append(
+                    self.ax_rl.plot(
+                        [p.real], [p.imag],
+                        marker="s", markersize=5,
+                        markerfacecolor="0.55", markeredgecolor="0.35",
+                        linestyle="None", zorder=5,
+                    )[0]
+                )
+
+        if pole is not None and np.isfinite(pole.real) and np.isfinite(pole.imag):
+            self._sel_artists.append(
+                self.ax_rl.plot(
+                    [pole.real], [pole.imag],
+                    marker="o", markersize=9,
+                    markerfacecolor="red", markeredgecolor="red",
+                    linestyle="None", zorder=6,
+                )[0]
+            )
 
         self.canvas.draw_idle()
         self._plot_step_for_K(K)
-        self._update_info_for_K(K, pole)
+        if pole is not None and K > 0:
+            self._update_info_for_K(K, pole)
+        else:
+            self._set_info_idle()
+
+    def _k_slider_range(self):
+        karr = np.asarray(self._klist if self._klist is not None else [], dtype=float).ravel()
+        positive = karr[np.isfinite(karr) & (karr > 0)]
+        if positive.size == 0:
+            return 1e-3, 1.0
+        kmax = float(np.max(positive))
+        return kmax * 1e-6, kmax
+
+    def _set_k_display(self, K):
+        self.k_value.blockSignals(True)
+        try:
+            self.k_value.setText(f"{float(K):.6g}")
+        except (TypeError, ValueError):
+            self.k_value.setText("")
+        self.k_value.blockSignals(False)
+
+        kmin, kmax = self._k_slider_range()
+        self.k_slider.blockSignals(True)
+        self.k_slider.setValue(k_slider_pos(K, kmin, kmax))
+        self.k_slider.blockSignals(False)
+
+    def _on_k_slider_changed(self, value):
+        kmin, kmax = self._k_slider_range()
+        self._apply_gain(k_from_slider_pos(value, kmin, kmax))
+
+    def _on_k_edit_finished(self):
+        text = self.k_value.text().strip()
+        try:
+            K = float(text)
+        except ValueError:
+            self._set_k_display(self.selected_k)
+            return
+        if not np.isfinite(K) or K < 0:
+            self._set_k_display(self.selected_k)
+            return
+        self._apply_gain(K)
+
+    def _on_scroll_zoom(self, event):
+        if event.inaxes != self.ax_rl:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        button = getattr(event, "button", None)
+        if button == "up":
+            factor = 0.80
+        elif button == "down":
+            factor = 1.25
+        else:
+            return
+
+        x0, x1 = self.ax_rl.get_xlim()
+        y0, y1 = self.ax_rl.get_ylim()
+        cx, cy = event.xdata, event.ydata
+        self._suppress_grid_events = True
+        try:
+            self.ax_rl.set_xlim(cx + (x0 - cx) * factor, cx + (x1 - cx) * factor)
+            self.ax_rl.set_ylim(cy + (y0 - cy) * factor, cy + (y1 - cy) * factor)
+        finally:
+            self._suppress_grid_events = False
+        self._view_lims = (self.ax_rl.get_xlim(), self.ax_rl.get_ylim())
+        self._redraw_grid()
+
+    def get_state(self):
+        """Snapshot of the design so it can be restored on the next open."""
+        return {
+            "comp_zeros": list(self.comp_zeros),
+            "comp_poles": list(self.comp_poles),
+            "comp_czero_pairs": [tuple(v) for v in self.comp_czero_pairs],
+            "comp_cpole_pairs": [tuple(v) for v in self.comp_cpole_pairs],
+            "comp_integrators": int(self.comp_integrators),
+            "comp_origin_zeros": int(self.comp_origin_zeros),
+            "comp_history": list(self.comp_history),
+            "selected_k": float(self.selected_k),
+        }
 
     # ---------- Step response ----------
     def _plot_step_for_K(self, K: float):
@@ -580,7 +933,8 @@ class ControlPlotDialog(QDialog):
             t, y = ctrl.step_response(T, T=t)
 
             try:
-                info = ctrl.step_info(T)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    info = ctrl.step_info(T)
                 ts = float(info.get("SettlingTime", np.nan))
                 if np.isfinite(ts) and ts > 0:
                     t_final = max(0.12, 2.5 * ts)
@@ -621,8 +975,7 @@ class ControlPlotDialog(QDialog):
     def _set_info_idle(self):
         self.info.setText(
             "Root locus + step response\n\n"
-            "Click on the root locus to select a gain K.\n"
-            "The step response and parameters update instantly."
+            "No gain selected yet (K = 0)."
         )
 
     def _update_info_for_K(self, K: float, pole):
@@ -630,7 +983,8 @@ class ControlPlotDialog(QDialog):
         T = ctrl.feedback(L, 1, sign=-1)
 
         try:
-            si = ctrl.step_info(T)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                si = ctrl.step_info(T)
             step_txt = "\n".join([f"{k}: {si[k]}" for k in si])
         except Exception as e:
             step_txt = f"step_info error: {e}"
@@ -676,7 +1030,7 @@ class DiscreteControlPlotDialog(QDialog):
       - Export K*C(z) to digital controller tab (A..H)
     """
 
-    def __init__(self, parent, sysz, Ts):
+    def __init__(self, parent, sysz, Ts, state=None):
         super().__init__(parent)
         self.setWindowTitle("Discrete root locus (large)")
         self.resize(1450, 900)
@@ -702,10 +1056,24 @@ class DiscreteControlPlotDialog(QDialog):
         self.comp_integrators = 0
         self.comp_history = []
 
+        # Design state carried over from a previous open (compensator + gain).
+        state = state or {}
+        self.comp_zeros = list(state.get("comp_zeros", []))
+        self.comp_poles = list(state.get("comp_poles", []))
+        self.comp_czero_pairs = [tuple(v) for v in state.get("comp_czero_pairs", [])]
+        self.comp_cpole_pairs = [tuple(v) for v in state.get("comp_cpole_pairs", [])]
+        self.comp_origin_zeros = int(state.get("comp_origin_zeros", 0))
+        self.comp_delays = int(state.get("comp_delays", 0))
+        self.comp_integrators = int(state.get("comp_integrators", 0))
+        self.comp_history = list(state.get("comp_history", []))
+
         # ---- selected locus point ----
-        self.selected_k = 0.0
+        self.selected_k = float(state.get("selected_k", 0.0) or 0.0)
         self.selected_pole = None
         self.selected_index = 0
+        self._base_drawn = False
+        self._view_lims = None
+        self._sel_artists = []
 
         # ---- figure ----
         self.fig = Figure(constrained_layout=True)
@@ -714,20 +1082,35 @@ class DiscreteControlPlotDialog(QDialog):
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
 
+        # Grid refresh state: the z-grid depends on the visible limits.
+        self._grid_artists = []
+        self._suppress_grid_events = False
+        self._grid_timer = QTimer(self)
+        self._grid_timer.setSingleShot(True)
+        self._grid_timer.setInterval(40)
+        self._grid_timer.timeout.connect(self._redraw_grid)
+        self.ax_rl.callbacks.connect("xlim_changed", self._on_view_limits_changed)
+        self.ax_rl.callbacks.connect("ylim_changed", self._on_view_limits_changed)
+
         # ---- right-side widgets ----
         self.info = QTextEdit()
         self.info.setReadOnly(True)
-        self.info.setMinimumHeight(220)
-        self.info.setMaximumHeight(380)
+        self.info.setMinimumHeight(240)
+        self.info.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.k_slider_label = QLabel("Gain K")
         self.k_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
         self.k_slider.setMinimum(0)
-        self.k_slider.setMaximum(0)
+        self.k_slider.setMaximum(1000)
+        self.k_slider.setToolTip(
+            "Logarithmic gain slider (0 = open loop).\n"
+            "It follows clicks on the locus and typed gains."
+        )
 
         self.k_value = QtWidgets.QLineEdit()
         self.k_value.setReadOnly(False)
-        self.k_value.setPlaceholderText("Enter K and press Enter")
+        self.k_value.setPlaceholderText("Click locus or type K")
+        self.k_value.setToolTip("Type an exact gain and press Enter.")
 
         self.export_btn = QPushButton("Close and export to digital controller tab")
 
@@ -754,7 +1137,8 @@ class DiscreteControlPlotDialog(QDialog):
 
         self.comp_display = QTextEdit()
         self.comp_display.setReadOnly(True)
-        self.comp_display.setMinimumHeight(180)
+        self.comp_display.setMinimumHeight(80)
+        self.comp_display.setMaximumHeight(120)
 
         # ---- layout ----
         main = QHBoxLayout(self)
@@ -774,26 +1158,16 @@ class DiscreteControlPlotDialog(QDialog):
         info_group_layout.setContentsMargins(8, 8, 8, 8)
         info_group_layout.setSpacing(8)
 
-        # Make the text box expand, but not invade the controls below
-        self.info.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.info.setMinimumHeight(220)
-        self.info.setMaximumHeight(380)
-
-        info_group_layout.addWidget(self.info, 1)
-
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setFrameShadow(QFrame.Shadow.Sunken)
-        info_group_layout.addWidget(separator)
-
+        # Gain row on top (same layout as the continuous window).
         k_row = QHBoxLayout()
         k_row.setContentsMargins(0, 0, 0, 0)
         k_row.setSpacing(8)
         k_row.addWidget(self.k_slider_label, 0)
         k_row.addWidget(self.k_slider, 1)
         k_row.addWidget(self.k_value, 0)
-
         info_group_layout.addLayout(k_row, 0)
+
+        info_group_layout.addWidget(self.info, 1)
 
         btn_row_export = QHBoxLayout()
         btn_row_export.setContentsMargins(0, 0, 0, 0)
@@ -820,9 +1194,11 @@ class DiscreteControlPlotDialog(QDialog):
 
         comp_group_layout.addWidget(self.comp_display)
 
-        right_layout.addWidget(info_group, 3)
-        right_layout.addWidget(comp_group, 2)
+        right_layout.addWidget(info_group, 1)
+        right_layout.addWidget(comp_group, 0)
         main.addWidget(right, 2)
+
+        self.setMinimumSize(1000, 680)
 
         # ---- root locus state ----
         self._rlist = None
@@ -839,6 +1215,7 @@ class DiscreteControlPlotDialog(QDialog):
         self.export_btn.clicked.connect(self._close_and_export_to_digital_tab)
 
         self.canvas.mpl_connect("button_press_event", self._on_click_rlocus)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
 
         # ---- init ----
         self._rebuild_compensated_system()
@@ -847,16 +1224,12 @@ class DiscreteControlPlotDialog(QDialog):
         self._update_comp_display()
 
         if self._klist is not None and len(self._klist) > 0:
-            self.k_slider.blockSignals(True)
-            self.k_slider.setMinimum(0)
-            self.k_slider.setMaximum(len(self._klist) - 1)
-            self.k_slider.setValue(0)
-            self.k_slider.blockSignals(False)
-            self._select_point_from_k_index(0)
+            self._select_exact_k(self.selected_k)
         else:
             self._draw_root_locus(selected_poles=None)
             self._plot_step_for_K(0.0)
             self._set_info_idle()
+            self._set_k_display(0.0)
 
     # =========================================================
     # Compensator builder
@@ -1021,15 +1394,11 @@ class DiscreteControlPlotDialog(QDialog):
             self._rebuild_compensated_system()
             self._compute_root_locus_data()
             self._update_comp_display()
+            self._view_lims = None
+            self._base_drawn = False
 
             if self._klist is not None and len(self._klist) > 0:
-                idx = min(self.selected_index, len(self._klist) - 1)
-                self.k_slider.blockSignals(True)
-                self.k_slider.setMinimum(0)
-                self.k_slider.setMaximum(len(self._klist) - 1)
-                self.k_slider.setValue(idx)
-                self.k_slider.blockSignals(False)
-                self._select_point_from_k_index(idx)
+                self._select_exact_k(self.selected_k)
             else:
                 self._draw_root_locus(selected_poles=None)
                 self._plot_step_for_K(0.0)
@@ -1062,15 +1431,11 @@ class DiscreteControlPlotDialog(QDialog):
         self._rebuild_compensated_system()
         self._compute_root_locus_data()
         self._update_comp_display()
+        self._view_lims = None
+        self._base_drawn = False
 
         if self._klist is not None and len(self._klist) > 0:
-            idx = min(self.selected_index, len(self._klist) - 1)
-            self.k_slider.blockSignals(True)
-            self.k_slider.setMinimum(0)
-            self.k_slider.setMaximum(len(self._klist) - 1)
-            self.k_slider.setValue(idx)
-            self.k_slider.blockSignals(False)
-            self._select_point_from_k_index(idx)
+            self._select_exact_k(self.selected_k)
         else:
             self._draw_root_locus(selected_poles=None)
             self._plot_step_for_K(0.0)
@@ -1086,17 +1451,15 @@ class DiscreteControlPlotDialog(QDialog):
         self.comp_integrators = 0
         self.comp_history = []
 
+        self.selected_k = 0.0
         self._rebuild_compensated_system()
         self._compute_root_locus_data()
         self._update_comp_display()
+        self._view_lims = None
+        self._base_drawn = False
 
         if self._klist is not None and len(self._klist) > 0:
-            self.k_slider.blockSignals(True)
-            self.k_slider.setMinimum(0)
-            self.k_slider.setMaximum(len(self._klist) - 1)
-            self.k_slider.setValue(0)
-            self.k_slider.blockSignals(False)
-            self._select_point_from_k_index(0)
+            self._select_exact_k(0.0)
         else:
             self._draw_root_locus(selected_poles=None)
             self._plot_step_for_K(0.0)
@@ -1110,45 +1473,95 @@ class DiscreteControlPlotDialog(QDialog):
         self._rlist = np.asarray(rldata.loci)
         self._klist = np.asarray(rldata.gains)
 
-    def _draw_root_locus(self, selected_poles=None):
-        self.ax_rl.clear()
+    def _draw_root_locus(self, selected_poles=None, redraw_base=False):
+        redraw = bool(redraw_base or not self._base_drawn)
 
-        plot_root_locus_clean(self.sys, self.ax_rl)
-
-        parent = self.parent()
-        if hasattr(parent, "_set_zplane_limits"):
-            points = []
-            points.append(selected_poles)
+        for artist in self._sel_artists:
             try:
-                points.append(ctrl.poles(self.sys))
-                points.append(ctrl.zeros(self.sys))
+                artist.remove()
             except Exception:
                 pass
-            parent._set_zplane_limits(self.ax_rl, points)
-        else:
-            self.ax_rl.set_aspect('equal', adjustable='box')
+        self._sel_artists = []
 
-        if hasattr(parent, "_overlay_zgrid"):
-            parent._overlay_zgrid(self.ax_rl, show_labels=True, Ts=self.Ts)
+        if redraw:
+            self._suppress_grid_events = True
+            try:
+                self.ax_rl.clear()
+                self._grid_artists = []
 
-        self.ax_rl.set_title("")
-        self.ax_rl.set_xlabel("")
-        self.ax_rl.set_ylabel("")
+                plot_root_locus_clean(self.sys, self.ax_rl)
+
+                parent = self.parent()
+                if hasattr(parent, "_set_zplane_limits"):
+                    points = []
+                    points.append(selected_poles)
+                    try:
+                        points.append(ctrl.poles(self.sys))
+                        points.append(ctrl.zeros(self.sys))
+                    except Exception:
+                        pass
+                    parent._set_zplane_limits(self.ax_rl, points, aspect="auto")
+                else:
+                    self.ax_rl.set_aspect('auto')
+
+                self.ax_rl.set_title("")
+                self.ax_rl.set_xlabel("")
+                self.ax_rl.set_ylabel("")
+                self._base_drawn = True
+
+                # Keep the zoom level chosen by the user, if any.
+                if self._view_lims is not None:
+                    try:
+                        self.ax_rl.set_xlim(*self._view_lims[0])
+                        self.ax_rl.set_ylim(*self._view_lims[1])
+                    except Exception:
+                        pass
+            finally:
+                self._suppress_grid_events = False
+
+            self._redraw_grid()
 
         if selected_poles is not None:
-            selected_poles = np.atleast_1d(selected_poles)
-            for p in selected_poles:
+            for p in np.atleast_1d(selected_poles):
+                p = complex(p)
                 if np.isfinite(p.real) and np.isfinite(p.imag):
-                    self.ax_rl.plot(
-                        [p.real], [p.imag],
-                        marker="s",
-                        markersize=7,
-                        markerfacecolor="black",
-                        markeredgecolor="black",
-                        linestyle="None",
-                        zorder=6
+                    self._sel_artists.append(
+                        self.ax_rl.plot(
+                            [p.real], [p.imag],
+                            marker="s",
+                            markersize=7,
+                            markerfacecolor="black",
+                            markeredgecolor="black",
+                            linestyle="None",
+                            zorder=6
+                        )[0]
                     )
 
+        self.canvas.draw_idle()
+
+    def _on_view_limits_changed(self, _ax=None):
+        if getattr(self, "_suppress_grid_events", False):
+            return
+        self._grid_timer.start()
+
+    def _redraw_grid(self):
+        """Remove and redraw the z-grid for the current visible limits."""
+        self._suppress_grid_events = True
+        try:
+            for artist in self._grid_artists:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+            self._grid_artists = []
+
+            parent = self.parent()
+            if hasattr(parent, "_overlay_zgrid"):
+                self._grid_artists = list(
+                    parent._overlay_zgrid(self.ax_rl, show_labels=True, Ts=self.Ts)
+                )
+        finally:
+            self._suppress_grid_events = False
         self.canvas.draw_idle()
 
     def _select_point_from_k_index(self, ik):
@@ -1156,42 +1569,22 @@ class DiscreteControlPlotDialog(QDialog):
             return
         if ik < 0 or ik >= len(self._klist):
             return
-
-        K = float(self._klist[ik])
-        poles = np.asarray(self._rlist[ik, :]).ravel()
-
-        mags = np.abs(poles)
-        inside = np.where(mags < 1.0)[0]
-
-        if len(inside) > 0:
-            idx_main = inside[np.argmax(mags[inside])]
-        else:
-            idx_main = np.argmax(mags)
-
-        pole_main = poles[idx_main]
-
-        self.selected_index = int(ik)
-        self.selected_k = K
-        self.selected_pole = pole_main
-
-        self.k_slider.blockSignals(True)
-        self.k_slider.setValue(int(ik))
-        self.k_slider.blockSignals(False)
-
-        self.k_value.blockSignals(True)
-        self.k_value.setText(f"{K:.6g}")
-        self.k_value.blockSignals(False)
-
-        self._draw_root_locus(selected_poles=poles)
-        self._plot_step_for_K(K)
-        self._update_info_for_K(K, pole_main)
+        self._select_exact_k(float(self._klist[ik]))
 
     def _select_exact_k(self, K):
-        K = float(K)
+        try:
+            K = float(K)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(K) or K < 0:
+            return
+        if K < 1e-9:
+            K = 0.0
 
-        L = ctrl.minreal(K * self.sys, verbose=False)
-        T = ctrl.feedback(L, 1, sign=-1)
-        poles = np.asarray(ctrl.poles(T)).ravel()
+        if K > 0:
+            poles = closed_loop_poles(self.sys, K)
+        else:
+            poles = np.asarray(ctrl.poles(self.sys), dtype=complex).ravel()
 
         if len(poles) == 0:
             return
@@ -1209,63 +1602,62 @@ class DiscreteControlPlotDialog(QDialog):
         self.selected_k = K
         self.selected_pole = pole_main
 
-        # keep slider approximately synced to nearest sampled k
         if self._klist is not None and len(self._klist) > 0:
             karr = np.asarray(self._klist, dtype=float).ravel()
-            idx_near = int(np.argmin(np.abs(karr - K)))
-            self.selected_index = idx_near
+            self.selected_index = int(np.argmin(np.abs(karr - K)))
 
-            self.k_slider.blockSignals(True)
-            self.k_slider.setValue(idx_near)
-            self.k_slider.blockSignals(False)
-
-        self.k_value.blockSignals(True)
-        self.k_value.setText(f"{K:.6g}")
-        self.k_value.blockSignals(False)
-
+        self._set_k_display(K)
         self._draw_root_locus(selected_poles=poles)
         self._plot_step_for_K(K)
         self._update_info_for_K(K, pole_main)
 
+    def _k_slider_range(self):
+        karr = np.asarray(self._klist if self._klist is not None else [], dtype=float).ravel()
+        positive = karr[np.isfinite(karr) & (karr > 0)]
+        if positive.size == 0:
+            return 1e-3, 1.0
+        kmax = float(np.max(positive))
+        return kmax * 1e-6, kmax
+
+    def _set_k_display(self, K):
+        self.k_value.blockSignals(True)
+        try:
+            self.k_value.setText(f"{float(K):.6g}")
+        except (TypeError, ValueError):
+            self.k_value.setText("")
+        self.k_value.blockSignals(False)
+
+        kmin, kmax = self._k_slider_range()
+        self.k_slider.blockSignals(True)
+        self.k_slider.setValue(k_slider_pos(K, kmin, kmax))
+        self.k_slider.blockSignals(False)
+
     def _on_k_slider_changed(self, value):
-        if self._klist is None or len(self._klist) == 0:
-            return
-        K = float(self._klist[int(value)])
-        self._select_exact_k(K)
+        kmin, kmax = self._k_slider_range()
+        self._select_exact_k(k_from_slider_pos(value, kmin, kmax))
 
     def _set_k_from_value(self, K_user):
-        if self._klist is None or len(self._klist) == 0:
-            return
-
-        karr = np.asarray(self._klist, dtype=float).ravel()
-        idx = int(np.argmin(np.abs(karr - K_user)))
-        self._select_point_from_k_index(idx)
+        self._select_exact_k(K_user)
 
     def _on_k_edit_finished(self):
         txt = self.k_value.text().strip()
-        if not txt:
-            self.k_value.blockSignals(True)
-            self.k_value.setText(f"{self.selected_k:.6g}")
-            self.k_value.blockSignals(False)
-            return
-
         try:
             K_user = float(txt)
-        except ValueError:
-            self.k_value.blockSignals(True)
-            self.k_value.setText(f"{self.selected_k:.6g}")
-            self.k_value.blockSignals(False)
+        except (TypeError, ValueError):
+            self._set_k_display(self.selected_k)
             return
 
-        if not np.isfinite(K_user):
-            self.k_value.blockSignals(True)
-            self.k_value.setText(f"{self.selected_k:.6g}")
-            self.k_value.blockSignals(False)
+        if not np.isfinite(K_user) or K_user < 0:
+            self._set_k_display(self.selected_k)
             return
 
         self._select_exact_k(K_user)
 
     def _on_click_rlocus(self, event):
+        if getattr(self.toolbar, "mode", ""):
+            return   # pan/zoom tool active: let the toolbar handle the click
+        if getattr(event, "button", 1) != 1:
+            return
         if event.inaxes != self.ax_rl:
             return
         if event.xdata is None or event.ydata is None:
@@ -1273,14 +1665,75 @@ class DiscreteControlPlotDialog(QDialog):
         if self._rlist is None or self._klist is None:
             return
 
-        z_click = event.xdata + 1j * event.ydata
+        z_click = complex(event.xdata, event.ydata)
 
-        diffs = np.abs(self._rlist - z_click)
-        idx_flat = np.argmin(diffs)
-        ik, _ = np.unravel_index(idx_flat, diffs.shape)
+        seed = None
+        try:
+            diffs = np.abs(self._rlist - z_click)
+            idx_flat = int(np.argmin(diffs))
+            ik, _ = np.unravel_index(idx_flat, diffs.shape)
+            seed = float(self._klist[ik])
+        except Exception:
+            seed = None
 
-        K = float(self._klist[ik])
+        try:
+            K = locus_gain_from_point(self.sys, z_click, k_seed=seed)
+        except Exception:
+            return
+
+        poles = closed_loop_poles(self.sys, K)
+        if poles.size == 0:
+            return
+        pole = poles[int(np.argmin(np.abs(poles - z_click)))]
+
+        try:
+            x1, y1 = self.ax_rl.transData.transform((z_click.real, z_click.imag))
+            x2, y2 = self.ax_rl.transData.transform((pole.real, pole.imag))
+            if float(np.hypot(x1 - x2, y1 - y2)) > 30:
+                return   # click is not close to any branch
+        except Exception:
+            pass
+
         self._select_exact_k(K)
+
+    def _on_scroll_zoom(self, event):
+        if event.inaxes != self.ax_rl:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        button = getattr(event, "button", None)
+        if button == "up":
+            factor = 0.80
+        elif button == "down":
+            factor = 1.25
+        else:
+            return
+
+        x0, x1 = self.ax_rl.get_xlim()
+        y0, y1 = self.ax_rl.get_ylim()
+        cx, cy = event.xdata, event.ydata
+        self._suppress_grid_events = True
+        try:
+            self.ax_rl.set_xlim(cx + (x0 - cx) * factor, cx + (x1 - cx) * factor)
+            self.ax_rl.set_ylim(cy + (y0 - cy) * factor, cy + (y1 - cy) * factor)
+        finally:
+            self._suppress_grid_events = False
+        self._view_lims = (self.ax_rl.get_xlim(), self.ax_rl.get_ylim())
+        self._redraw_grid()
+
+    def get_state(self):
+        """Snapshot of the design so it can be restored on the next open."""
+        return {
+            "comp_zeros": list(self.comp_zeros),
+            "comp_poles": list(self.comp_poles),
+            "comp_czero_pairs": [tuple(v) for v in self.comp_czero_pairs],
+            "comp_cpole_pairs": [tuple(v) for v in self.comp_cpole_pairs],
+            "comp_origin_zeros": int(self.comp_origin_zeros),
+            "comp_delays": int(self.comp_delays),
+            "comp_integrators": int(self.comp_integrators),
+            "comp_history": list(self.comp_history),
+            "selected_k": float(self.selected_k),
+        }
 
     # =========================================================
     # Step response and info
@@ -1299,7 +1752,8 @@ class DiscreteControlPlotDialog(QDialog):
 
             # Refine x-axis using actual settling time
             try:
-                info = ctrl.step_info(T)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    info = ctrl.step_info(T)
                 ts = float(info.get("SettlingTime", np.nan))
                 if np.isfinite(ts) and ts > 0:
                     t_final = max(8 * self.Ts, 2.5 * ts)
@@ -1341,7 +1795,7 @@ class DiscreteControlPlotDialog(QDialog):
     def _set_info_idle(self):
         self.info.setText(
             "Discrete root locus + step response\n\n"
-            "Use the K slider or click on the locus to select a gain."
+            "No gain selected yet (K = 0)."
         )
 
     def _poly_to_zinv_str(self, coeffs, var='z', digits=5, eps=1e-12):
@@ -1405,7 +1859,8 @@ class DiscreteControlPlotDialog(QDialog):
         T = ctrl.feedback(L, 1, sign=-1)
 
         try:
-            si = ctrl.step_info(T)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                si = ctrl.step_info(T)
             step_txt = "\n".join([f"{k}: {si[k]}" for k in si])
         except Exception as e:
             step_txt = f"step_info error: {e}"
@@ -1800,10 +2255,17 @@ class PortSelectDialog(QDialog):
         self.setWindowTitle("Select COM Port")
         self.initial_port = initial_port
         self._ports = []
+        self.gui_only = False
         # Widgets
         self.label = QLabel("Choose the serial (COM) port to use:")
         self.combo = QComboBox()
         self.btn_refresh = QPushButton("Refresh")
+        self.btn_gui_only = QPushButton("GUI only (no hardware)")
+        self.btn_gui_only.setToolTip(
+            "Open the interface without a Teensy/COM port.\n"
+            "Simulation, system identification data and controller design remain available;\n"
+            "serial commands are simply not sent."
+        )
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
 
         # Layout
@@ -1813,11 +2275,13 @@ class PortSelectDialog(QDialog):
         row.addWidget(self.btn_refresh)
         top.addWidget(self.label)
         top.addLayout(row)
+        top.addWidget(self.btn_gui_only)
         top.addWidget(self.buttons)
         self.setLayout(top)
 
         # Signals
         self.btn_refresh.clicked.connect(self.populate)
+        self.btn_gui_only.clicked.connect(self._choose_gui_only)
         self.buttons.accepted.connect(self.validate_and_accept)
         self.buttons.rejected.connect(self.reject)
 
@@ -1835,7 +2299,21 @@ class PortSelectDialog(QDialog):
             if idx != -1:
                 self.combo.setCurrentIndex(idx)
 
+        if self._ports:
+            self.label.setText("Choose the serial (COM) port to use:")
+        else:
+            self.label.setText(
+                "No serial ports detected. Connect the Teensy and press Refresh, "
+                "or choose 'GUI only' to work without hardware."
+            )
+
+    def _choose_gui_only(self):
+        self.gui_only = True
+        self.accept()
+
     def selected_port(self):
+        if self.gui_only:
+            return None
         idx = self.combo.currentIndex()
         if idx < 0:
             return None
@@ -1844,12 +2322,17 @@ class PortSelectDialog(QDialog):
     def validate_and_accept(self):
         port = self.selected_port()
         if not port:
-            QMessageBox.warning(self, "No port selected", "Please select a COM port or click Cancel to exit.")
+            QMessageBox.warning(
+                self, "No port selected",
+                "Please select a COM port, choose 'GUI only' to work without hardware, "
+                "or click Cancel to exit.",
+            )
             return
+        self.gui_only = False
         self.accept()
 
 class MyDialog(QtWidgets.QDialog):
-    def __init__(self, port=None, parent=None):
+    def __init__(self, port=None, gui_only=False, parent=None):
         super(MyDialog, self).__init__(parent)
         ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "QtDesignerGUI.ui")
         uic.loadUi(ui_path, self)  # load the UI first
@@ -1895,6 +2378,7 @@ class MyDialog(QtWidgets.QDialog):
         self._persistent_line_edit_names = self._collect_persistent_line_edit_names()
         self._load_line_edit_config()
         self._runtime_config_values = self._default_runtime_config_values()
+        self._design_states = {}
         # ---- make the dialog look/behave like a normal resizable window ----
         flags = self.windowFlags()
         flags |= Qt.WindowType.WindowSystemMenuHint          # show system menu
@@ -1913,7 +2397,10 @@ class MyDialog(QtWidgets.QDialog):
         self.setMinimumSize(900, 600)      # pick a sane minimum so content isn’t cramped
 
         base_title = "Motor DC Control - By A Von Chong"
-        if port:
+        self.gui_only = bool(gui_only)
+        if self.gui_only:
+            self.setWindowTitle(f"{base_title} — GUI only")
+        elif port:
             self.setWindowTitle(f"{base_title} — {port}")
         else:
             self.setWindowTitle(f"{base_title} — no port")
@@ -1923,7 +2410,7 @@ class MyDialog(QtWidgets.QDialog):
         self._last_reconnect_attempt = 0.0
         self._reconnect_interval_s = 1.0
         self._serial_status_message = ""
-        if port:
+        if port and not self.gui_only:
             try:
                 self.serial_port = serial.Serial(port, 115200, timeout=0.05, write_timeout=0.05)
                 self.controller_connected = True
@@ -2199,6 +2686,9 @@ class MyDialog(QtWidgets.QDialog):
         self._update_reference_controls_visibility()
         self._connect_line_edit_config_saves()
 
+        if self.gui_only:
+            self.textBrowser.setText("GUI only — no hardware connected, commands are not sent")
+
         # Comienza todos los timers
         self.timer.start()
         self.timerHora.start()
@@ -2225,6 +2715,8 @@ class MyDialog(QtWidgets.QDialog):
             self.toggleupdate_parameters()
 
     def _try_reconnect_serial(self):
+        if getattr(self, "gui_only", False):
+            return False
         now = monotonic()
         if now - self._last_reconnect_attempt < self._reconnect_interval_s:
             return False
@@ -3069,8 +3561,11 @@ class MyDialog(QtWidgets.QDialog):
         try:
             sysz = self._read_tf_from_zrlocus_inputs()
             Ts = self._line_edit_float(self.lqr_sampling, default=0.02, minimum=1e-9)
-            dlg = DiscreteControlPlotDialog(self, sysz, Ts)
+            key = design_state_key("discrete", sysz, extra=(round(float(Ts), 12),))
+            state = self._design_states.get(key)
+            dlg = DiscreteControlPlotDialog(self, sysz, Ts, state=state)
             dlg.exec()
+            self._design_states[key] = dlg.get_state()
         except Exception as e:
             if hasattr(self, "plot_error"):
                 self.plot_error.setText(f"Discrete RL error: {e}")
@@ -3618,8 +4113,11 @@ class MyDialog(QtWidgets.QDialog):
     def open_big_rlocus(self):
         try:
             sys = self._read_tf_from_rlocus_inputs()
-            dlg = ControlPlotDialog(self, sys)
+            key = design_state_key("continuous", sys)
+            state = self._design_states.get(key)
+            dlg = ControlPlotDialog(self, sys, state=state)
             dlg.exec()
+            self._design_states[key] = dlg.get_state()
         except Exception as e:
             if hasattr(self, "plot_error"):
                 self.plot_error.setText(f"Root locus error: {e}")
@@ -3628,8 +4126,11 @@ class MyDialog(QtWidgets.QDialog):
         try:
             sysz = self._read_discrete_rlocus_sys()
             Ts = self._line_edit_float(self.sampling_time, default=0.02, minimum=1e-9)
-            dlg = DiscreteControlPlotDialog(self, sysz, Ts)
+            key = design_state_key("discrete", sysz, extra=(round(float(Ts), 12),))
+            state = self._design_states.get(key)
+            dlg = DiscreteControlPlotDialog(self, sysz, Ts, state=state)
             dlg.exec()
+            self._design_states[key] = dlg.get_state()
         except Exception as e:
             if hasattr(self, "plot_error"):
                 self.plot_error.setText(f"Discrete root locus error: {e}")
@@ -3661,8 +4162,12 @@ class MyDialog(QtWidgets.QDialog):
         """
         Overlay an s-plane damping grid on top of an existing root-locus plot.
         Does NOT change aspect ratio or limits.
+
+        Returns the artists it creates, so the caller can remove and redraw the
+        grid when the user zooms or pans (the grid is computed from the current
+        visible limits).
         """
-        import numpy as np
+        artists = []
 
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
@@ -3672,18 +4177,18 @@ class MyDialog(QtWidgets.QDialog):
 
         # Only meaningful for left-half plane
         if xmin >= 0:
-            return
+            return artists
 
         # Turn off rectangular grid; keep only damping grid
         ax.grid(False)
 
-        grid_color = '0.75'
+        grid_color = '0.74'
         grid_lw = 0.8
         grid_ls = ':'
 
         # Axes
-        ax.axhline(0, color='0.65', lw=0.8, zorder=0)
-        ax.axvline(0, color='0.65', lw=0.8, zorder=0)
+        artists.append(ax.axhline(0, color='0.65', lw=0.8, zorder=0))
+        artists.append(ax.axvline(0, color='0.65', lw=0.8, zorder=0))
 
         # Damping ratio lines only
         zetas = [0.1, 0.2, 0.3, 0.4, 0.50, 0.6, 0.7, 0.8, 0.9]
@@ -3696,7 +4201,9 @@ class MyDialog(QtWidgets.QDialog):
                 ang = np.pi - sign * theta
                 x = np.array([0.0, rmax * np.cos(ang)])
                 y = np.array([0.0, rmax * np.sin(ang)])
-                ax.plot(x, y, color=grid_color, lw=grid_lw, ls=grid_ls, zorder=0)
+                artists.extend(
+                    ax.plot(x, y, color=grid_color, lw=grid_lw, ls=grid_ls, zorder=0)
+                )
 
             if show_labels:
                 # Put labels on the damping lines at a fixed radius from the origin
@@ -3705,19 +4212,23 @@ class MyDialog(QtWidgets.QDialog):
                 ylab = np.sqrt(max(0.0, 1.0 - z**2)) * rlabel
 
                 if xmin < xlab < xmax and ymin < ylab < ymax:
-                    ax.text(
-                        xlab, ylab, f"{z:.2f}",
-                        color='0.45', fontsize=8,
-                        ha='center', va='bottom',
-                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15)
+                    artists.append(
+                        ax.text(
+                            xlab, ylab, f"{z:.2f}",
+                            color='0.45', fontsize=8,
+                            ha='center', va='bottom',
+                            bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15)
+                        )
                     )
 
                 if xmin < xlab < xmax and ymin < -ylab < ymax:
-                    ax.text(
-                        xlab, -ylab, f"{z:.2f}",
-                        color='0.45', fontsize=8,
-                        ha='center', va='top',
-                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15)
+                    artists.append(
+                        ax.text(
+                            xlab, -ylab, f"{z:.2f}",
+                            color='0.45', fontsize=8,
+                            ha='center', va='top',
+                            bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15)
+                        )
                     )
 
         # ---- Natural frequency circles (left-half-plane semicircles) ----
@@ -3754,15 +4265,21 @@ class MyDialog(QtWidgets.QDialog):
         for wn in wns:
             x = wn * np.cos(th)
             y = wn * np.sin(th)
-            ax.plot(x, y, color=grid_color, lw=grid_lw, ls=grid_ls, zorder=0)
+            artists.extend(
+                ax.plot(x, y, color=grid_color, lw=grid_lw, ls=grid_ls, zorder=0)
+            )
 
             if show_labels and xmin < -wn < xmax:
-                ax.text(
-                    -wn, 0.03 * (ymax - ymin), f"{wn:g}",
-                    color='0.45', fontsize=8,
-                    ha='center', va='bottom',
-                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15)
+                artists.append(
+                    ax.text(
+                        -wn, 0.03 * (ymax - ymin), f"{wn:g}",
+                        color='0.45', fontsize=8,
+                        ha='center', va='bottom',
+                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15)
+                    )
                 )
+
+        return artists
 
     def _finite_complex_points(self, *values):
         points = []
@@ -3803,7 +4320,7 @@ class MyDialog(QtWidgets.QDialog):
 
         return self._finite_complex_points(*points)
 
-    def _set_zplane_limits(self, ax, points=None):
+    def _set_zplane_limits(self, ax, points=None, aspect="equal"):
         unit = np.exp(1j * np.linspace(0, 2 * np.pi, 360))
 
         values = [unit]
@@ -3830,113 +4347,141 @@ class MyDialog(QtWidgets.QDialog):
 
         ax.set_xlim(xmid - 0.5 * span, xmid + 0.5 * span)
         ax.set_ylim(ymid - 0.5 * span, ymid + 0.5 * span)
-        ax.set_aspect('equal', adjustable='box')
+        if aspect == "equal":
+            ax.set_aspect('equal', adjustable='box')
+        else:
+            # Fill the available rectangle: the unit circle becomes an ellipse
+            # and the z-grid is drawn stretched, like the classic textbook plot.
+            ax.set_aspect('auto')
 
     def _overlay_zgrid(self, ax, show_labels=True, Ts=None):
+        """
+        Overlay a z-plane grid on top of a discrete root-locus plot:
+
+          - unit circle,
+          - constant damping ratio curves (spirals z = exp((-zeta + j*sqrt(1-zeta^2))*w*T)),
+          - constant normalized frequency curves (w*T = fraction of pi).
+
+        Returns the artists it creates, so the caller can refresh the grid when
+        the user zooms (the labels are clipped to the visible limits).
+        """
+        artists = []
         ax.grid(False)
 
-        try:
-            Ts = float(Ts)
-            if not np.isfinite(Ts) or Ts <= 0:
-                Ts = None
-        except Exception:
-            Ts = None
+        xmin, xmax = ax.get_xlim()
+        ymin, ymax = ax.get_ylim()
 
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
-        xmin, xmax = xlim
-        ymin, ymax = ylim
-
-        def _inside(z):
-            return xmin < z.real < xmax and ymin < z.imag < ymax
-
-        grid_color = '0.70'
-        light_color = '0.86'
+        circle_color = '0.35'
+        freq_color = '0.40'
+        damping_color = '0.58'
         grid_lw = 0.8
         grid_ls = ':'
 
-        theta = np.linspace(0, 2 * np.pi, 720)
-
-        # Unit circle
-        ax.plot(
-            np.cos(theta), np.sin(theta),
-            color=grid_color, lw=1.1, ls=grid_ls, zorder=1
-        )
-
-        # Axes
-        ax.axhline(0, color='0.72', lw=0.8, zorder=1)
-        ax.axvline(0, color='0.72', lw=0.8, zorder=1)
-
-        # Constant damping-ratio curves mapped from s-plane through z = exp(s Ts).
-        theta_d = np.linspace(0.0, np.pi, 600)
-        zetas = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-        for zeta in zetas:
-            beta = zeta / np.sqrt(max(1e-12, 1.0 - zeta**2))
-            radius = np.exp(-beta * theta_d)
-            z_upper = radius * np.exp(1j * theta_d)
-            ax.plot(
-                z_upper.real, z_upper.imag,
-                color=light_color, lw=grid_lw, ls=grid_ls, zorder=1
+        def _visible(z, margin=0.0):
+            return (
+                (xmin - margin) <= z.real <= (xmax + margin)
+                and (ymin - margin) <= z.imag <= (ymax + margin)
             )
+
+        label_bbox = dict(facecolor='white', edgecolor='none', alpha=0.80, pad=0.6)
+
+        # ---- Unit circle and axes ----
+        theta = np.linspace(0.0, 2.0 * np.pi, 720)
+        artists.append(
             ax.plot(
-                z_upper.real, -z_upper.imag,
-                color=light_color, lw=grid_lw, ls=grid_ls, zorder=1
+                np.cos(theta), np.sin(theta),
+                color=circle_color, lw=1.0, zorder=1
+            )[0]
+        )
+        artists.append(ax.axhline(0.0, color='0.72', lw=0.8, zorder=1))
+        artists.append(ax.axvline(0.0, color='0.72', lw=0.8, zorder=1))
+
+        # ---- Constant damping ratio (zeta) curves ----
+        zetas = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        theta_d = np.linspace(0.0, np.pi, 600)
+
+        # Labels are placed where the zeta curves cross the w*T = 0.35*pi curve,
+        # which reproduces the tidy near-vertical column of the classic z-grid.
+        rho_label = 0.35 * np.pi
+
+        for zeta in zetas:
+            beta = zeta / np.sqrt(max(1e-12, 1.0 - zeta ** 2))
+            radius = np.exp(-beta * theta_d)
+            upper = radius * np.exp(1j * theta_d)
+
+            artists.extend(
+                ax.plot(
+                    upper.real, upper.imag,
+                    color=damping_color, lw=grid_lw, ls=grid_ls, zorder=1
+                )
+            )
+            artists.extend(
+                ax.plot(
+                    upper.real, -upper.imag,
+                    color=damping_color, lw=grid_lw, ls=grid_ls, zorder=1
+                )
             )
 
             if show_labels:
-                theta_label = 0.9
-                r_label = np.exp(-beta * theta_label)
-                z_label = r_label * np.exp(1j * theta_label)
-                if _inside(z_label):
-                    ax.text(
-                        z_label.real, z_label.imag,
-                        f"{zeta:.1f}",
-                        color='0.48', fontsize=8,
-                        ha='center', va='bottom',
-                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15),
-                        zorder=3
+                theta_lbl = np.sqrt(max(0.0, 1.0 - zeta ** 2)) * rho_label
+                r_lbl = np.exp(-zeta * rho_label)
+                z_label = r_lbl * np.exp(1j * theta_lbl)
+                if _visible(z_label):
+                    artists.append(
+                        ax.text(
+                            z_label.real, z_label.imag, f"{zeta:.1f}",
+                            color='0.15', fontsize=8,
+                            ha='center', va='bottom',
+                            bbox=label_bbox, zorder=4
+                        )
                     )
 
-        # Constant natural-frequency curves. rho = wn * Ts is rad/sample.
-        rho_levels = np.linspace(np.pi / 5.0, np.pi, 5)
-        for rho in rho_levels:
-            theta_n = np.linspace(-rho, rho, 700)
-            log_radius = -np.sqrt(np.maximum(rho**2 - theta_n**2, 0.0))
+        # ---- Constant normalized frequency curves (w*T between 0 and pi) ----
+        fractions = np.arange(1, 10) / 10.0
+
+        for frac in fractions:
+            rho = frac * np.pi
+            theta_n = np.linspace(-rho, rho, 600)
+            log_radius = -np.sqrt(np.maximum(rho ** 2 - theta_n ** 2, 0.0))
             radius = np.exp(log_radius)
             z_curve = radius * np.exp(1j * theta_n)
-            ax.plot(
-                z_curve.real, z_curve.imag,
-                color=grid_color, lw=grid_lw, ls=grid_ls, zorder=1
+
+            artists.extend(
+                ax.plot(
+                    z_curve.real, z_curve.imag,
+                    color=freq_color, lw=grid_lw, ls=grid_ls, zorder=1
+                )
             )
 
             if show_labels:
-                label_z = complex(np.exp(-rho), 0.0)
-                label = f"{rho / Ts:.3g}" if Ts else f"{rho:.2g}"
-                if _inside(label_z):
-                    ax.text(
-                        label_z.real, 0.025 * (ymax - ymin),
-                        label,
-                        color='0.45', fontsize=8,
-                        ha='center', va='bottom',
-                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.15),
-                        zorder=3
+                label_r = 0.90
+                for sign, va in ((+1, 'top'), (-1, 'bottom')):
+                    z_lab = label_r * np.exp(1j * sign * rho)
+                    if _visible(z_lab):
+                        artists.append(
+                            ax.text(
+                                z_lab.real, z_lab.imag, f"{frac:.1f}π/T",
+                                color='0.15', fontsize=7.5,
+                                ha='center', va=va,
+                                bbox=label_bbox, zorder=4
+                            )
+                        )
+
+        # Nyquist limit (w*T = pi) sits on the negative real axis.
+        if show_labels:
+            for sign, va in ((+1, 'bottom'), (-1, 'top')):
+                z_lab = complex(-0.97, sign * 0.045)
+                if _visible(z_lab):
+                    artists.append(
+                        ax.text(
+                            z_lab.real, z_lab.imag, "1π/T",
+                            color='0.15', fontsize=7.5,
+                            ha='left', va=va,
+                            bbox=label_bbox, zorder=4
+                        )
                     )
 
-        if show_labels:
-            labels = [
-                (complex(1.0, 0.0), "1", (4, 4), 'left', 'bottom'),
-                (complex(-1.0, 0.0), "-1", (-4, 4), 'right', 'bottom'),
-                (complex(0.0, 1.0), "j", (4, 4), 'left', 'bottom'),
-                (complex(0.0, -1.0), "-j", (4, -4), 'left', 'top'),
-            ]
-            for z, text, offset, ha, va in labels:
-                if _inside(z):
-                    ax.annotate(
-                        text, xy=(z.real, z.imag), xytext=offset,
-                        textcoords='offset points',
-                        color='0.45', fontsize=8, ha=ha, va=va,
-                        zorder=3
-                    )
+        return artists
 
     def open_big_pid_tuner_step(self):
         if self.pid_tuner_dialog_open:
@@ -4319,7 +4864,9 @@ class MyDialog(QtWidgets.QDialog):
         PWM_max = runtime_config["PWM_max"]
         RPM_filter = runtime_config["RPM_filter"]
         self.SendData(StartStop, selected_mode, A, B, C, D, E, F, G, H, delay, tiemporeferencia, amplitud, referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time,PPR,PWM_min,PWM_max,RPM_filter)
-        if not self.controller_connected:
+        if self.gui_only:
+            self.textBrowser.setText("GUI only — no hardware connected, commands are not sent")
+        elif not self.controller_connected:
             self.textBrowser.setText("Controlador desconectado, esperando reconexión")
         elif selected_text == "Disabled":
             self.textBrowser.setText("System disabled, select an operation mode before starting")
@@ -4794,25 +5341,41 @@ class MyDialog(QtWidgets.QDialog):
 
 
 def main():
-    app = QtWidgets.QApplication(sys.argv)
+    # "python GUI.py --gui-only" opens the interface without looking for hardware.
+    gui_only_flag = any(
+        str(arg).strip().lower() in ("--gui-only", "-g", "--gui_only")
+        for arg in sys.argv[1:]
+    )
+    app = QtWidgets.QApplication([
+        arg for arg in sys.argv
+        if str(arg).strip().lower() not in ("--gui-only", "-g", "--gui_only")
+    ])
 
-    port = auto_find_port()
+    port = None if gui_only_flag else auto_find_port()
+    gui_only = gui_only_flag
     while True:
-        if not port:
+        if not port and not gui_only:
             sel = PortSelectDialog()
             if sel.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                 sys.exit(0)
-            port = sel.selected_port()
+            gui_only = bool(sel.gui_only)
+            port = None if gui_only else sel.selected_port()
+            if not gui_only and not port:
+                continue
 
-        dlg = MyDialog(port=port)
-        if dlg.serial_port is not None:   # opened OK in your constructor
-            dlg.setWindowTitle(f"Motor DC Control — {port} - By A Von Chong")
+        dlg = MyDialog(port=port, gui_only=gui_only)
+        if gui_only or dlg.serial_port is not None:   # opened OK in the constructor
+            if gui_only:
+                dlg.setWindowTitle("Motor DC Control — GUI only - By A Von Chong")
+            else:
+                dlg.setWindowTitle(f"Motor DC Control — {port} - By A Von Chong")
             dlg.show()
             sys.exit(app.exec())
 
         QtWidgets.QMessageBox.warning(None, "Serial",
                                       f"Couldn't open {port}. Close other apps or pick another.")
         port = None  # force dialog on next loop
+        gui_only = False
 
 if __name__ == "__main__":
     main()
