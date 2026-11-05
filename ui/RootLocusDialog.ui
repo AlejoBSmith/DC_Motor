@@ -1,0 +1,503 @@
+<?xml version='1.0' encoding='utf-8'?>
+<ui version="4.0">
+ <class>RootLocusDialog</class>
+ <widget class="QDialog" name="RootLocusDialog">
+  <property name="windowTitle">
+   <string>Root locus (large)</string>
+  </property>
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1400</width>
+    <height>850</height>
+   </rect>
+  </property>
+  <property name="minimumSize">
+   <size>
+    <width>900</width>
+    <height>600</height>
+   </size>
+  </property>
+  <layout class="QVBoxLayout" name="layout_67">
+   <property name="leftMargin">
+    <number>10</number>
+   </property>
+   <property name="topMargin">
+    <number>10</number>
+   </property>
+   <property name="rightMargin">
+    <number>10</number>
+   </property>
+   <property name="bottomMargin">
+    <number>10</number>
+   </property>
+   <property name="spacing">
+    <number>8</number>
+   </property>
+   <item>
+    <widget class="QSplitter" name="plot_splitter">
+     <property name="orientation">
+      <enum>Qt::Horizontal</enum>
+     </property>
+     <property name="childrenCollapsible">
+      <bool>false</bool>
+     </property>
+     <widget class="QWidget" name="plot_panel">
+      <layout class="QVBoxLayout" name="layout_68">
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <property name="spacing">
+        <number>8</number>
+       </property>
+       <item>
+        <widget class="PlotToolbar" name="toolbar">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="PlotCanvas" name="canvas">
+         <property name="minimumSize">
+          <size>
+           <width>280</width>
+           <height>300</height>
+          </size>
+         </property>
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QScrollArea" name="plot_controls_scroll">
+      <property name="widgetResizable">
+       <bool>true</bool>
+      </property>
+      <property name="frameShape">
+       <enum>QFrame::NoFrame</enum>
+      </property>
+      <widget class="QWidget" name="plot_controls">
+       <layout class="QVBoxLayout" name="layout_69">
+        <property name="leftMargin">
+         <number>4</number>
+        </property>
+        <property name="topMargin">
+         <number>4</number>
+        </property>
+        <property name="rightMargin">
+         <number>4</number>
+        </property>
+        <property name="bottomMargin">
+         <number>4</number>
+        </property>
+        <property name="spacing">
+         <number>10</number>
+        </property>
+        <item>
+         <widget class="QGroupBox" name="info_group">
+          <property name="title">
+           <string>Design info</string>
+          </property>
+          <layout class="QVBoxLayout" name="layout_70">
+           <property name="leftMargin">
+            <number>8</number>
+           </property>
+           <property name="topMargin">
+            <number>8</number>
+           </property>
+           <property name="rightMargin">
+            <number>8</number>
+           </property>
+           <property name="bottomMargin">
+            <number>8</number>
+           </property>
+           <property name="spacing">
+            <number>8</number>
+           </property>
+           <item>
+            <layout class="QHBoxLayout" name="layout_71">
+             <property name="leftMargin">
+              <number>0</number>
+             </property>
+             <property name="topMargin">
+              <number>0</number>
+             </property>
+             <property name="rightMargin">
+              <number>0</number>
+             </property>
+             <property name="bottomMargin">
+              <number>0</number>
+             </property>
+             <property name="spacing">
+              <number>8</number>
+             </property>
+             <item>
+              <widget class="QLabel" name="k_label">
+               <property name="text">
+                <string>Gain K</string>
+               </property>
+               <property name="wordWrap">
+                <bool>true</bool>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QSlider" name="k_slider">
+               <property name="orientation">
+                <enum>Qt::Horizontal</enum>
+               </property>
+               <property name="maximum">
+                <number>1000</number>
+               </property>
+               <property name="toolTip">
+                <string>Logarithmic gain slider (0 = open loop).
+It follows the value selected with a click on the locus.</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLineEdit" name="k_value">
+               <property name="minimumSize">
+                <size>
+                 <width>40</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <property name="readOnly">
+                <bool>false</bool>
+               </property>
+               <property name="toolTip">
+                <string>Type an exact gain and press Enter.</string>
+               </property>
+               <property name="placeholderText">
+                <string>Click the locus or type K</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QTextEdit" name="info">
+             <property name="readOnly">
+              <bool>true</bool>
+             </property>
+             <property name="minimumSize">
+              <size>
+               <width>0</width>
+               <height>210</height>
+              </size>
+             </property>
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="export_btn">
+             <property name="text">
+              <string>Close and export to continuous controller tab</string>
+             </property>
+             <property name="enabled">
+              <bool>true</bool>
+             </property>
+             <property name="autoDefault">
+              <bool>false</bool>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        <item>
+         <widget class="QGroupBox" name="comp_group">
+          <property name="title">
+           <string>Compensator C(s)</string>
+          </property>
+          <layout class="QVBoxLayout" name="layout_72">
+           <property name="leftMargin">
+            <number>8</number>
+           </property>
+           <property name="topMargin">
+            <number>8</number>
+           </property>
+           <property name="rightMargin">
+            <number>8</number>
+           </property>
+           <property name="bottomMargin">
+            <number>8</number>
+           </property>
+           <property name="spacing">
+            <number>8</number>
+           </property>
+           <item>
+            <layout class="QFormLayout" name="comp_form">
+             <property name="leftMargin">
+              <number>0</number>
+             </property>
+             <property name="topMargin">
+              <number>0</number>
+             </property>
+             <property name="rightMargin">
+              <number>0</number>
+             </property>
+             <property name="bottomMargin">
+              <number>0</number>
+             </property>
+             <property name="spacing">
+              <number>8</number>
+             </property>
+             <property name="fieldGrowthPolicy">
+              <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
+             </property>
+             <property name="rowWrapPolicy">
+              <enum>QFormLayout::WrapLongRows</enum>
+             </property>
+             <item row="0" column="0" rowspan="1" colspan="1">
+              <widget class="QLabel" name="comp_type_label">
+               <property name="text">
+                <string>Element</string>
+               </property>
+               <property name="wordWrap">
+                <bool>true</bool>
+               </property>
+              </widget>
+             </item>
+             <item row="0" column="1" rowspan="1" colspan="1">
+              <widget class="QComboBox" name="comp_type">
+               <item>
+                <property name="text">
+                 <string>Real zero</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>Real pole</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>Complex zero pair</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>Complex pole pair</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>Integrator (1/s)</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>Zero at origin (s)</string>
+                </property>
+               </item>
+              </widget>
+             </item>
+             <item row="1" column="0" rowspan="1" colspan="1">
+              <widget class="QLabel" name="comp_value_label">
+               <property name="text">
+                <string>Location</string>
+               </property>
+               <property name="wordWrap">
+                <bool>true</bool>
+               </property>
+              </widget>
+             </item>
+             <item row="1" column="1" rowspan="1" colspan="1">
+              <widget class="QLineEdit" name="comp_value">
+               <property name="minimumSize">
+                <size>
+                 <width>40</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <property name="readOnly">
+                <bool>false</bool>
+               </property>
+               <property name="placeholderText">
+                <string>e.g. 2  -&gt;  s = -2</string>
+               </property>
+              </widget>
+             </item>
+             <item row="2" column="0" rowspan="1" colspan="1">
+              <widget class="QLabel" name="comp_imag_label">
+               <property name="text">
+                <string>Imag</string>
+               </property>
+               <property name="wordWrap">
+                <bool>true</bool>
+               </property>
+              </widget>
+             </item>
+             <item row="2" column="1" rowspan="1" colspan="1">
+              <widget class="QLineEdit" name="comp_imag">
+               <property name="minimumSize">
+                <size>
+                 <width>40</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="sizePolicy">
+                <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                 <horstretch>0</horstretch>
+                 <verstretch>0</verstretch>
+                </sizepolicy>
+               </property>
+               <property name="readOnly">
+                <bool>false</bool>
+               </property>
+               <property name="placeholderText">
+                <string>e.g. 3  -&gt;  ±j3</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="layout_74">
+             <property name="leftMargin">
+              <number>0</number>
+             </property>
+             <property name="topMargin">
+              <number>0</number>
+             </property>
+             <property name="rightMargin">
+              <number>0</number>
+             </property>
+             <property name="bottomMargin">
+              <number>0</number>
+             </property>
+             <property name="spacing">
+              <number>8</number>
+             </property>
+             <item>
+              <widget class="QPushButton" name="comp_add_btn">
+               <property name="text">
+                <string>Add</string>
+               </property>
+               <property name="enabled">
+                <bool>true</bool>
+               </property>
+               <property name="autoDefault">
+                <bool>false</bool>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="comp_undo_btn">
+               <property name="text">
+                <string>Undo</string>
+               </property>
+               <property name="enabled">
+                <bool>true</bool>
+               </property>
+               <property name="autoDefault">
+                <bool>false</bool>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="comp_clear_btn">
+               <property name="text">
+                <string>Clear</string>
+               </property>
+               <property name="enabled">
+                <bool>true</bool>
+               </property>
+               <property name="autoDefault">
+                <bool>false</bool>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QTextEdit" name="comp_display">
+             <property name="readOnly">
+              <bool>true</bool>
+             </property>
+             <property name="minimumSize">
+              <size>
+               <width>0</width>
+               <height>90</height>
+              </size>
+             </property>
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        <property name="sizeConstraint">
+         <enum>QLayout::SetMinimumSize</enum>
+        </property>
+       </layout>
+      </widget>
+      <property name="minimumSize">
+       <size>
+        <width>340</width>
+        <height>0</height>
+       </size>
+      </property>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>PlotCanvas</class>
+   <extends>QWidget</extends>
+   <header>ui_widgets</header>
+  </customwidget>
+  <customwidget>
+   <class>PlotToolbar</class>
+   <extends>QWidget</extends>
+   <header>ui_widgets</header>
+  </customwidget>
+ </customwidgets>
+ <resources />
+ <connections />
+</ui>

@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import warnings
+from copy import deepcopy
 import pyqtgraph as pg
 import serial
 import serial.tools.list_ports
@@ -12,28 +13,17 @@ from collections import deque
 from time import monotonic, sleep
 from PyQt6 import QtCore, QtWidgets, uic
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtWidgets import (
-    QButtonGroup,
-    QComboBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QFrame,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QMessageBox,
-    QPushButton,
-    QSizePolicy,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
-from scipy.optimize import least_squares, minimize, minimize_scalar
+from PyQt6.QtWidgets import QButtonGroup, QDialog, QMessageBox
+from scipy.optimize import least_squares, minimize_scalar
 from scipy.signal import cont2discrete
-from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
+from control_runtime import (
+    controller_to_zinv, deployment_coefficients, deployment_period_ms, simulate_pwm_loop,
+    continuous_controller_coefficients, discretize_continuous_controller,
+)
+from system_identification import resample_held_input, simulate_zoh_transfer
+from coefficient_edit import CoefficientEdit
+from pid_tuning import tune_pid
 
 KNOWN_VIDPID = {
     (0x16C0, 0x0483),  # Teensy 4.x USB-Serial (PJRC)
@@ -42,6 +32,19 @@ KNOWN_VIDPID = {
 }
 PREF_DESCR = ("Teensy", "UNO R4")  # optional: bias by description text
 LINE_EDIT_CONFIG_FILENAME = ".gui_config.json"
+
+
+def _load_designer_form(window, filename):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    uic.loadUi(path, window)
+
+
+def _fit_designer_window(window):
+    available = window.screen().availableGeometry()
+    window.setMinimumSize(min(window.minimumWidth(), available.width()),
+                          min(window.minimumHeight(), available.height()))
+    window.resize(min(window.width(), available.width()), min(window.height(), available.height()))
+
 
 def auto_find_port():
     ports = list(serial.tools.list_ports.comports())
@@ -98,10 +101,9 @@ def locus_gain_from_point(sys, point, k_seed=None):
     """
     Gain K whose closed-loop pole is closest to `point` in the s/z plane.
 
-    python-control samples the locus on a coarse gain grid (about 72 points by
-    default), so selecting the nearest sample makes K jump in big steps. Here
-    the gain is refined continuously with a bounded 1-D search on log(K), which
-    turns a click (or a zoomed click) on a branch into a fine gain value.
+    Keep the gain implied by the characteristic equation as a candidate, then
+    refine local minima near it and the sampled locus. Distance to the nearest
+    pole is not unimodal over a wide gain range, especially on curved branches.
     """
     point = complex(point)
     num, den = tf_num_den(sys)
@@ -112,34 +114,52 @@ def locus_gain_from_point(sys, point, k_seed=None):
             return np.inf
         return float(np.min(np.abs(poles - point)))
 
-    seed = None
+    seeds = []
     try:
         with np.errstate(divide="ignore", invalid="ignore"):
-            loop_value = np.polyval(num, point) / np.polyval(den, point)
-        if np.isfinite(loop_value) and abs(loop_value) > 0:
-            seed = 1.0 / abs(loop_value)   # magnitude condition |K*L(s)| = 1
+            gain = -np.polyval(den, point) / np.polyval(num, point)
+        if np.isfinite(gain):
+            seeds.extend([float(gain.real), float(abs(gain))])
     except Exception:
-        seed = None
+        pass
 
     if k_seed is not None:
         try:
             k_seed = float(k_seed)
             if np.isfinite(k_seed) and k_seed > 0:
-                seed = k_seed
+                seeds.append(k_seed)
         except (TypeError, ValueError):
             pass
 
-    if seed is None or not np.isfinite(seed) or seed <= 0:
-        seed = 1.0
-    seed = max(float(seed), 1e-12)
+    seeds = sorted(set(seed for seed in seeds if np.isfinite(seed) and seed > 0)) or [1.0]
+    best_k, best_distance = 0.0, distance(0.0)
+    for seed in seeds:
+        candidate_distance = distance(seed)
+        if candidate_distance < best_distance:
+            best_k, best_distance = seed, candidate_distance
+    # A click exactly on a branch already satisfies D(point) + K*N(point) = 0.
+    if best_distance <= 1e-12 * max(1.0, abs(point)):
+        return float(best_k)
 
-    result = minimize_scalar(
-        lambda log_k: distance(np.exp(log_k)),
-        bounds=(np.log(seed) - 12.0, np.log(seed) + 12.0),
-        method="bounded",
-        options={"xatol": 1e-7, "maxiter": 200},
-    )
-    return float(np.exp(result.x))
+    log_grid = np.unique(np.concatenate([
+        np.log(seed) + np.linspace(-np.log(4.0), np.log(4.0), 9) for seed in seeds
+    ]))
+    distances = np.asarray([distance(np.exp(log_k)) for log_k in log_grid])
+    for i, candidate_distance in enumerate(distances):
+        if candidate_distance < best_distance:
+            best_k, best_distance = float(np.exp(log_grid[i])), candidate_distance
+        if (0 < i < len(log_grid) - 1 and np.isfinite(candidate_distance)
+                and candidate_distance <= distances[i - 1] and candidate_distance <= distances[i + 1]):
+            result = minimize_scalar(
+                lambda log_k: distance(np.exp(log_k)),
+                bounds=(log_grid[i - 1], log_grid[i + 1]), method="bounded",
+                options={"xatol": 1e-9, "maxiter": 60},
+            )
+            if result.fun < best_distance:
+                best_k, best_distance = float(np.exp(result.x)), float(result.fun)
+    if not np.isfinite(best_distance):
+        raise ValueError("No finite closed-loop pole could be selected.")
+    return float(best_k)
 
 
 def k_slider_pos(K, kmin, kmax, steps=1000):
@@ -294,8 +314,7 @@ class ControlPlotDialog(QDialog):
 
     def __init__(self, parent, sys, state=None):
         super().__init__(parent)
-        self.setWindowTitle("Root locus (large)")
-        self.resize(1400, 850)
+        _load_designer_form(self, "ui/RootLocusDialog.ui")
 
         flags = self.windowFlags()
         self.setWindowFlags(
@@ -331,11 +350,11 @@ class ControlPlotDialog(QDialog):
         self._view_lims = None
 
         # ---- Figure: 2 rows (RL on top, Step on bottom) ----
-        self.fig = Figure(constrained_layout=True)
+        self.fig = self.canvas.figure
+        self.fig.set_layout_engine("constrained")
         self.ax_rl = self.fig.add_subplot(211)
         self.ax_step = self.fig.add_subplot(212)
-        self.canvas = FigureCanvas(self.fig)
-        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.toolbar.bind_canvas(self.canvas)
 
         # Grid refresh state: the damping grid depends on the visible limits.
         self._grid_artists = []
@@ -347,101 +366,9 @@ class ControlPlotDialog(QDialog):
         self.ax_rl.callbacks.connect("xlim_changed", self._on_view_limits_changed)
         self.ax_rl.callbacks.connect("ylim_changed", self._on_view_limits_changed)
 
-        # ---- Right side info ----
-        self.info = QTextEdit()
-        self.info.setReadOnly(True)
+        _fit_designer_window(self)
 
-        # ---- Gain controls ----
-        self.k_label = QLabel("Gain K")
-        self.k_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
-        self.k_slider.setRange(0, 1000)
-        self.k_slider.setToolTip(
-            "Logarithmic gain slider (0 = open loop).\n"
-            "It follows the value selected with a click on the locus."
-        )
-        self.k_value = QtWidgets.QLineEdit()
-        self.k_value.setPlaceholderText("Click the locus or type K")
-        self.k_value.setToolTip("Type an exact gain and press Enter.")
-
-        # ---- Compensator builder widgets ----
-        self.comp_title = QLabel("Compensator C(s)")
-        self.comp_type = QComboBox()
-        self.comp_type.addItems([
-            "Real zero",
-            "Real pole",
-            "Complex zero pair",
-            "Complex pole pair",
-            "Integrator (1/s)",
-            "Zero at origin (s)"
-        ])
-
-        self.comp_value = QtWidgets.QLineEdit()
-        self.comp_value.setPlaceholderText("e.g. 2  ->  s = -2")
-        self.comp_imag = QtWidgets.QLineEdit()
-        self.comp_imag.setPlaceholderText("e.g. 3  ->  ±j3")
-
-        self.comp_add_btn = QPushButton("Add")
-        self.comp_undo_btn = QPushButton("Undo")
-        self.comp_clear_btn = QPushButton("Clear")
-
-        self.comp_display = QTextEdit()
-        self.comp_display.setReadOnly(True)
-        self.comp_display.setMinimumHeight(80)
-        self.comp_display.setMaximumHeight(120)
-
-        # ---- Layout ----
-        main = QHBoxLayout(self)
-
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(self.toolbar)
-        left_layout.addWidget(self.canvas)
-        main.addWidget(left, 3)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-
-        info_group = QGroupBox("Design info")
-        info_group_layout = QVBoxLayout(info_group)
-        info_group_layout.setContentsMargins(8, 8, 8, 8)
-
-        k_row = QHBoxLayout()
-        k_row.setContentsMargins(0, 0, 0, 0)
-        k_row.setSpacing(8)
-        k_row.addWidget(self.k_label, 0)
-        k_row.addWidget(self.k_slider, 1)
-        k_row.addWidget(self.k_value, 0)
-        info_group_layout.addLayout(k_row)
-        info_group_layout.addWidget(self.info, 1)
-
-        comp_group = QGroupBox("Compensator C(s)")
-        comp_group_layout = QVBoxLayout(comp_group)
-        comp_group_layout.setContentsMargins(8, 8, 8, 8)
-
-        form = QFormLayout()
-        self.comp_form = form
-        form.addRow("Element", self.comp_type)
-        form.addRow("Location", self.comp_value)
-        form.addRow("Imag", self.comp_imag)
-        comp_group_layout.addLayout(form)
-
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(self.comp_add_btn)
-        btn_row.addWidget(self.comp_undo_btn)
-        btn_row.addWidget(self.comp_clear_btn)
-        comp_group_layout.addLayout(btn_row)
-
-        comp_group_layout.addWidget(self.comp_display)
-
-        self.info.setMinimumHeight(240)
-        self.info.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-        right_layout.addWidget(info_group, 1)
-        right_layout.addWidget(comp_group, 0)
-        main.addWidget(right, 2)
-
-        self.setMinimumSize(1000, 650)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
 
         # Root locus picking state
         self._rlist = None
@@ -454,6 +381,7 @@ class ControlPlotDialog(QDialog):
         self.comp_type.currentIndexChanged.connect(self._update_comp_input_visibility)
         self.k_slider.valueChanged.connect(self._on_k_slider_changed)
         self.k_value.editingFinished.connect(self._on_k_edit_finished)
+        self.export_btn.clicked.connect(self._close_and_export_to_continuous_tab)
 
         # Initial plots
         self._rebuild_compensated_system()
@@ -466,6 +394,15 @@ class ControlPlotDialog(QDialog):
         # Connect click picking and zooming
         self.canvas.mpl_connect("button_press_event", self._on_click_rlocus)
         self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
+
+    def _close_and_export_to_continuous_tab(self):
+        try:
+            controller = float(self.selected_k or 0) * self.comp_sys
+            if self.parent()._import_continuous_controller(controller):
+                self.parent()._remember_controller_design("continuous", self)
+                self.accept()
+        except (ValueError, TypeError, OverflowError) as exc:
+            self.info.append(f"\nExport error: {exc}")
 
     # ---------- Compensator builder ----------
     def _build_compensator_tf(self):
@@ -943,7 +880,7 @@ class ControlPlotDialog(QDialog):
             except Exception:
                 pass
 
-            self.ax_step.plot(t, y)
+            self.parent()._plot_time_mpl(self.ax_step, t, y)
             self.ax_step.set_xlim(float(t[0]), float(t[-1]))
 
             ymin = float(np.min(y))
@@ -1027,13 +964,12 @@ class DiscreteControlPlotDialog(QDialog):
       - Left: Root locus in z-plane + step response
       - Right: text info + gain slider + compensator builder
       - Click on locus => updates info + step plot + slider
-      - Export K*C(z) to digital controller tab (A..H)
+      - Export K*C(z) to digital controller tab (A..I)
     """
 
     def __init__(self, parent, sysz, Ts, state=None):
         super().__init__(parent)
-        self.setWindowTitle("Discrete root locus (large)")
-        self.resize(1450, 900)
+        _load_designer_form(self, "ui/DiscreteRootLocusDialog.ui")
 
         flags = self.windowFlags()
         self.setWindowFlags(
@@ -1076,11 +1012,11 @@ class DiscreteControlPlotDialog(QDialog):
         self._sel_artists = []
 
         # ---- figure ----
-        self.fig = Figure(constrained_layout=True)
+        self.fig = self.canvas.figure
+        self.fig.set_layout_engine("constrained")
         self.ax_rl = self.fig.add_subplot(211)
         self.ax_step = self.fig.add_subplot(212)
-        self.canvas = FigureCanvas(self.fig)
-        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.toolbar.bind_canvas(self.canvas)
 
         # Grid refresh state: the z-grid depends on the visible limits.
         self._grid_artists = []
@@ -1092,113 +1028,26 @@ class DiscreteControlPlotDialog(QDialog):
         self.ax_rl.callbacks.connect("xlim_changed", self._on_view_limits_changed)
         self.ax_rl.callbacks.connect("ylim_changed", self._on_view_limits_changed)
 
-        # ---- right-side widgets ----
-        self.info = QTextEdit()
-        self.info.setReadOnly(True)
-        self.info.setMinimumHeight(240)
-        self.info.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.pwm_mode.setItemData(0, 2)
+        self.pwm_mode.setItemData(1, 3)
+        self.pwm_plant_input.setItemData(0, "applied")
+        self.pwm_plant_input.setItemData(1, "effective")
+        self.pwm_mode.setCurrentIndex(1 if "Position" in parent.modooperacion.currentText() else 0)
+        self.pwm_deadzone.setValue(parent._line_edit_int(parent.deadzone, minimum=0, maximum=255))
+        self.pwm_bits.setValue(parent.firmware_pwm_bits or (12 if parent.gui_only else 8))
+        pwm_state = state.get("pwm", {})
+        if pwm_state:
+            self.pwm_compare.setChecked(bool(pwm_state.get("compare", False)))
+            self.pwm_reference.setValue(int(pwm_state.get("reference", 1)))
+            for combo, key in ((self.pwm_mode, "mode"), (self.pwm_plant_input, "plant_input")):
+                index = combo.findData(pwm_state.get(key))
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            self.pwm_deadzone.setValue(int(pwm_state.get("deadzone", self.pwm_deadzone.value())))
+            self.pwm_bits.setValue(int(pwm_state.get("bits", self.pwm_bits.value())))
+        _fit_designer_window(self)
 
-        self.k_slider_label = QLabel("Gain K")
-        self.k_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
-        self.k_slider.setMinimum(0)
-        self.k_slider.setMaximum(1000)
-        self.k_slider.setToolTip(
-            "Logarithmic gain slider (0 = open loop).\n"
-            "It follows clicks on the locus and typed gains."
-        )
-
-        self.k_value = QtWidgets.QLineEdit()
-        self.k_value.setReadOnly(False)
-        self.k_value.setPlaceholderText("Click locus or type K")
-        self.k_value.setToolTip("Type an exact gain and press Enter.")
-
-        self.export_btn = QPushButton("Close and export to digital controller tab")
-
-        self.comp_type = QComboBox()
-        self.comp_type.addItems([
-            "Real zero",
-            "Real pole",
-            "Complex zero pair",
-            "Complex pole pair",
-            "Zero at origin",
-            "Sample delay (z^-1)",
-            "Integrator"
-        ])
-
-        self.comp_value = QtWidgets.QLineEdit()
-        self.comp_value.setPlaceholderText("e.g. 0.6")
-
-        self.comp_imag = QtWidgets.QLineEdit()
-        self.comp_imag.setPlaceholderText("e.g. 0.2")
-
-        self.comp_add_btn = QPushButton("Add")
-        self.comp_undo_btn = QPushButton("Undo")
-        self.comp_clear_btn = QPushButton("Clear")
-
-        self.comp_display = QTextEdit()
-        self.comp_display.setReadOnly(True)
-        self.comp_display.setMinimumHeight(80)
-        self.comp_display.setMaximumHeight(120)
-
-        # ---- layout ----
-        main = QHBoxLayout(self)
-
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(self.toolbar)
-        left_layout.addWidget(self.canvas)
-        main.addWidget(left, 3)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-
-        info_group = QGroupBox("Design info")
-        info_group_layout = QVBoxLayout(info_group)
-        info_group_layout.setContentsMargins(8, 8, 8, 8)
-        info_group_layout.setSpacing(8)
-
-        # Gain row on top (same layout as the continuous window).
-        k_row = QHBoxLayout()
-        k_row.setContentsMargins(0, 0, 0, 0)
-        k_row.setSpacing(8)
-        k_row.addWidget(self.k_slider_label, 0)
-        k_row.addWidget(self.k_slider, 1)
-        k_row.addWidget(self.k_value, 0)
-        info_group_layout.addLayout(k_row, 0)
-
-        info_group_layout.addWidget(self.info, 1)
-
-        btn_row_export = QHBoxLayout()
-        btn_row_export.setContentsMargins(0, 0, 0, 0)
-        btn_row_export.addWidget(self.export_btn)
-
-        info_group_layout.addLayout(btn_row_export, 0)
-
-        comp_group = QGroupBox("Compensator C(z)")
-        comp_group_layout = QVBoxLayout(comp_group)
-        comp_group_layout.setContentsMargins(8, 8, 8, 8)
-
-        form = QFormLayout()
-        self.comp_form = form
-        form.addRow("Element", self.comp_type)
-        form.addRow("Location", self.comp_value)
-        form.addRow("Imag", self.comp_imag)
-        comp_group_layout.addLayout(form)
-
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(self.comp_add_btn)
-        btn_row.addWidget(self.comp_undo_btn)
-        btn_row.addWidget(self.comp_clear_btn)
-        comp_group_layout.addLayout(btn_row)
-
-        comp_group_layout.addWidget(self.comp_display)
-
-        right_layout.addWidget(info_group, 1)
-        right_layout.addWidget(comp_group, 0)
-        main.addWidget(right, 2)
-
-        self.setMinimumSize(1000, 680)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
 
         # ---- root locus state ----
         self._rlist = None
@@ -1213,6 +1062,12 @@ class DiscreteControlPlotDialog(QDialog):
         self.k_slider.valueChanged.connect(self._on_k_slider_changed)
         self.k_value.editingFinished.connect(self._on_k_edit_finished)
         self.export_btn.clicked.connect(self._close_and_export_to_digital_tab)
+        self.pwm_compare.toggled.connect(lambda: self._plot_step_for_K(self.selected_k))
+        self.pwm_reference.valueChanged.connect(lambda: self._plot_step_for_K(self.selected_k))
+        self.pwm_mode.currentIndexChanged.connect(lambda: self._plot_step_for_K(self.selected_k))
+        self.pwm_deadzone.valueChanged.connect(lambda: self._plot_step_for_K(self.selected_k))
+        self.pwm_bits.valueChanged.connect(lambda: self._plot_step_for_K(self.selected_k))
+        self.pwm_plant_input.currentIndexChanged.connect(lambda: self._plot_step_for_K(self.selected_k))
 
         self.canvas.mpl_connect("button_press_event", self._on_click_rlocus)
         self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
@@ -1259,7 +1114,7 @@ class DiscreteControlPlotDialog(QDialog):
         for _ in range(self.comp_integrators):
             C *= self.Ts / (z - 1)
 
-        return ctrl.minreal(C, verbose=False)
+        return C
 
     def _rebuild_compensated_system(self):
         C = self._build_compensator_tf()
@@ -1733,6 +1588,14 @@ class DiscreteControlPlotDialog(QDialog):
             "comp_integrators": int(self.comp_integrators),
             "comp_history": list(self.comp_history),
             "selected_k": float(self.selected_k),
+            "pwm": {
+                "compare": self.pwm_compare.isChecked(),
+                "reference": self.pwm_reference.value(),
+                "mode": self.pwm_mode.currentData(),
+                "deadzone": self.pwm_deadzone.value(),
+                "bits": self.pwm_bits.value(),
+                "plant_input": self.pwm_plant_input.currentData(),
+            },
         }
 
     # =========================================================
@@ -1763,14 +1626,35 @@ class DiscreteControlPlotDialog(QDialog):
             except Exception:
                 pass
 
-            self.ax_step.step(t, y, where="post", label="y[k]")
-            self.ax_step.axhline(1.0, linestyle="--", linewidth=1)
+            reference = self.pwm_reference.value()
+            y = np.asarray(y) * reference
+            self.parent()._plot_time_mpl(self.ax_step, t, y, label="Ideal (linear)")
+            self.ax_step.axhline(reference, linestyle="--", linewidth=1)
+            plotted = [y]
+            self.pwm_status.setText("")
+            self.last_pwm_simulation = None
+            if self.pwm_compare.isChecked():
+                try:
+                    self.last_pwm_simulation = simulate_pwm_loop(
+                        self.base_sys, K * self.comp_sys, np.full(len(t), reference),
+                        mode=self.pwm_mode.currentData(), deadzone=self.pwm_deadzone.value(),
+                        plant_input=self.pwm_plant_input.currentData(),
+                        pwm_bits=self.pwm_bits.value(),
+                    )
+                    y_pwm = self.last_pwm_simulation["output"]
+                    self.parent()._plot_time_mpl(self.ax_step, t, y_pwm, label="Integer PWM + saturation")
+                    plotted.append(y_pwm)
+                    self.pwm_status.setText(
+                        f"{self.pwm_bits.value()}-bit PWM model: fixed Ts, continuous sensor, no RPM filter or friction model."
+                    )
+                except Exception as exc:
+                    self.pwm_status.setText(f"PWM comparison unavailable: {exc}")
             self.ax_step.grid(True)
             self.ax_step.set_xlim(float(t[0]), float(t[-1]))
             self.ax_step.legend(loc="best")
 
-            ymin = float(np.min(y))
-            ymax = float(np.max(y))
+            ymin = float(min(np.min(values) for values in plotted))
+            ymax = float(max(np.max(values) for values in plotted))
             if abs(ymax - ymin) < 1e-9:
                 ymin -= 0.05
                 ymax += 0.05
@@ -1840,7 +1724,7 @@ class DiscreteControlPlotDialog(QDialog):
         Return K*C(z) in the implementation-friendly z^-1 form:
             (A + B z^-1 + ...)/(1 - E z^-1 - ...)
         """
-        Ck = ctrl.minreal(float(K) * self.comp_sys, verbose=False)
+        Ck = float(K) * self.comp_sys
         num, den = self._controller_to_zinv_coeffs(Ck)
 
         # normalize
@@ -1893,85 +1777,29 @@ class DiscreteControlPlotDialog(QDialog):
     # Export
     # =========================================================
     def _controller_to_zinv_coeffs(self, sys):
-        """
-        Convert a discrete TF written in descending powers of z into coefficients
-        written in descending powers of z^-1, using the denominator order as reference.
-
-        Example:
-            0.13111 / (z - 1)
-        becomes
-            0.13111 z^-1 / (1 - z^-1)
-
-        so numerator coeffs become [0, 0.13111]
-        and denominator coeffs become [1, -1].
-        """
-        num = np.asarray(sys.num[0][0], dtype=float).ravel()
-        den = np.asarray(sys.den[0][0], dtype=float).ravel()
-
-        # Normalize so den[0] = 1 in the polynomial-in-z representation
-        if abs(den[0]) > 1e-12:
-            num = num / den[0]
-            den = den / den[0]
-
-        # Let denominator order define the z^-1 expansion order
-        n_den = len(den) - 1
-        n_num = len(num) - 1
-
-        if n_num > n_den:
-            raise ValueError("Controller is improper: numerator order exceeds denominator order.")
-
-        # Convert to z^-1 form by dividing by z^n_den.
-        # This means LEFT-padding numerator so it aligns with powers:
-        # [z^m ... z^0] -> [z^0, z^-1, ..., z^-n_den]
-        pad_left = n_den - n_num
-        num_zinv = np.pad(num, (pad_left, 0), mode='constant')
-        den_zinv = den.copy()
-
-        # Normalize again just in case
-        if abs(den_zinv[0]) > 1e-12:
-            num_zinv = num_zinv / den_zinv[0]
-            den_zinv = den_zinv / den_zinv[0]
-
-        return num_zinv, den_zinv
+        return controller_to_zinv(sys)
 
     def _close_and_export_to_digital_tab(self):
         try:
             K = float(self.selected_k) if self.selected_k is not None else 0.0
-            Ck = ctrl.minreal(K * self.comp_sys, verbose=False)
-
-            num, den = self._controller_to_zinv_coeffs(Ck)
-
-            # Target form:
-            # H(z) = (A + B z^-1 + C z^-2 + D z^-3) /
-            #        (1 - E z^-1 - F z^-2 - G z^-3 - H z^-4)
-
-            # Pad/truncate to GUI size
-            num = np.pad(num, (0, max(0, 4 - len(num))), mode='constant')[:4]
-            den = np.pad(den, (0, max(0, 5 - len(den))), mode='constant')[:5]
-
-            # Ensure den[0] = 1
-            if abs(den[0]) > 1e-12:
-                num = num / den[0]
-                den = den / den[0]
-
+            Ck = K * self.comp_sys
+            num, feedback = deployment_coefficients(Ck)
+            period_ms = deployment_period_ms(self.Ts)
             p = self.parent()
-
-            # Numerator in z^-1 form
-            p.A.setText(f"{num[0]:.6g}")
-            p.B.setText(f"{num[1]:.6g}")
-            p.C.setText(f"{num[2]:.6g}")
-            p.D.setText(f"{num[3]:.6g}")
-
-            # Denominator expected as 1 - E z^-1 - F z^-2 - ...
-            p.E.setText(f"{(-den[1]):.6g}")
-            p.F.setText(f"{(-den[2]):.6g}")
-            p.G.setText(f"{(-den[3]):.6g}")
-            p.H.setText(f"{(-den[4]):.6g}")
+            if num[4] != 0 and not p.gui_only and not p._supports_b4:
+                raise ValueError("Firmware has not confirmed B4 support. Update/connect it before exporting I != 0.")
+            # Nine significant digits round-trip every firmware float32 coefficient.
+            for name, value in zip("ABCDI", num):
+                getattr(p, name).setText(f"{value:.9g}")
+            for name, value in zip("EFGH", feedback):
+                getattr(p, name).setText(f"{value:.9g}")
+            p.delay.setText(str(period_ms))
 
             # jump to "Discrete Contr"
-            p.tabWidget.setCurrentIndex(8)
+            p.tabWidget.setCurrentWidget(p.Digital)
 
             p.toggleupdate_parameters()
+            p._remember_controller_design("discrete", self)
             self.accept()
 
         except Exception as e:
@@ -1989,8 +1817,7 @@ class PIDTunerPlotDialog(QDialog):
         self.parent_dialog = parent
         self.G = G
 
-        self.setWindowTitle("PID Tuner (large)")
-        self.resize(1300, 850)
+        _load_designer_form(self, "ui/PIDTunerDialog.ui")
 
         flags = self.windowFlags()
         self.setWindowFlags(
@@ -2000,104 +1827,19 @@ class PIDTunerPlotDialog(QDialog):
         )
 
         # ---------- Figure ----------
-        self.fig = Figure(constrained_layout=True)
+        self.fig = self.canvas.figure
+        self.fig.set_layout_engine("constrained")
         self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvas(self.fig)
-        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.toolbar.bind_canvas(self.canvas)
 
-        # ---------- Right-side widgets ----------
-        self.controller_type_label = QLabel("Controller type:")
-        self.controller_type_combo = QComboBox()
-        self.controller_type_combo.addItems(["P", "PI", "PD", "PID"])
         idx = self.controller_type_combo.findText(ctype.upper())
         if idx >= 0:
             self.controller_type_combo.setCurrentIndex(idx)
-
-        self.speed_label = QLabel("Response speed")
-        self.speed_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setRange(0, 100)
         self.speed_slider.setValue(speed_value)
-        self.speed_value_label = QLabel(str(speed_value))
-
-        self.damping_label = QLabel("Transient behavior")
-        self.damping_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
-        self.damping_slider.setRange(0, 100)
+        self.speed_value_label.setText(str(speed_value))
         self.damping_slider.setValue(damping_value)
-        self.damping_value_label = QLabel(str(damping_value))
-
-        self.kp_label = QLabel("Kp")
-        self.kp_edit = QtWidgets.QLineEdit()
-        self.kp_edit.setReadOnly(True)
-
-        self.ki_label = QLabel("Ki")
-        self.ki_edit = QtWidgets.QLineEdit()
-        self.ki_edit.setReadOnly(True)
-
-        self.kd_label = QLabel("Kd")
-        self.kd_edit = QtWidgets.QLineEdit()
-        self.kd_edit.setReadOnly(True)
-
-        self.info = QTextEdit()
-        self.info.setReadOnly(True)
-        self.export_btn = QPushButton("Close and export to PID deployment tab")
-
-        # ---------- Layout ----------
-        main = QHBoxLayout(self)
-
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(self.toolbar)
-        left_layout.addWidget(self.canvas)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-
-        row_type = QHBoxLayout()
-        row_type.addWidget(self.controller_type_label)
-        row_type.addWidget(self.controller_type_combo)
-
-        row_speed = QHBoxLayout()
-        row_speed.addWidget(self.speed_label)
-        row_speed.addWidget(self.speed_slider)
-        row_speed.addWidget(self.speed_value_label)
-
-        row_damping = QHBoxLayout()
-        row_damping.addWidget(self.damping_label)
-        row_damping.addWidget(self.damping_slider)
-        row_damping.addWidget(self.damping_value_label)
-
-        row_kp = QHBoxLayout()
-        row_kp.addWidget(self.kp_label)
-        row_kp.addWidget(self.kp_edit)
-
-        row_ki = QHBoxLayout()
-        row_ki.addWidget(self.ki_label)
-        row_ki.addWidget(self.ki_edit)
-
-        row_kd = QHBoxLayout()
-        row_kd.addWidget(self.kd_label)
-        row_kd.addWidget(self.kd_edit)
-
-        right_layout.addLayout(row_type)
-        right_layout.addLayout(row_speed)
-        right_layout.addLayout(row_damping)
-        right_layout.addSpacing(10)
-        right_layout.addLayout(row_kp)
-        right_layout.addLayout(row_ki)
-        right_layout.addLayout(row_kd)
-        right_layout.addSpacing(10)
-        right_layout.addWidget(self.info)
-
-        export_row = QHBoxLayout()
-        export_row.addStretch()
-        export_row.addWidget(self.export_btn)
-
-        right_layout.addStretch()
-        right_layout.addLayout(export_row)
-
-        main.addWidget(left, 3)
-        main.addWidget(right, 2)
+        self.damping_value_label.setText(str(damping_value))
+        _fit_designer_window(self)
 
         # ---------- Debounced update ----------
         self._timer = QTimer(self)
@@ -2125,6 +1867,8 @@ class PIDTunerPlotDialog(QDialog):
         self._update_view()
 
     def _close_and_export_to_pid_tab(self):
+        if not self.export_btn.isEnabled():
+            return
         try:
             p = self.parent_dialog
 
@@ -2133,9 +1877,7 @@ class PIDTunerPlotDialog(QDialog):
             p.Ki.setText(f"{self.current_ki:.6g}")
             p.Kd.setText(f"{self.current_kd:.6g}")
 
-            # Optional: move to the PID deployment tab if you know its index/name
-            # Example:
-            p.tabWidget.setCurrentIndex(5)
+            p.tabWidget.setCurrentWidget(p.tab_3)
 
             # Push values through your existing flow
             p.toggleupdate_parameters()
@@ -2148,21 +1890,10 @@ class PIDTunerPlotDialog(QDialog):
     def _update_view(self):
         ctype = self.controller_type_combo.currentText().strip().upper()
 
-        # Temporarily reuse parent's tuning logic
-        old_type = self.parent_dialog.tuner_controller_type.currentText()
-        old_speed = self.parent_dialog.tuner_speed_slider.value()
-        old_damping = self.parent_dialog.tuner_damping_slider.value()
-
         try:
-            # Mirror current dialog settings into parent logic
-            idx = self.parent_dialog.tuner_controller_type.findText(ctype)
-            if idx >= 0:
-                self.parent_dialog.tuner_controller_type.setCurrentIndex(idx)
-
-            self.parent_dialog.tuner_speed_slider.setValue(self.speed_slider.value())
-            self.parent_dialog.tuner_damping_slider.setValue(self.damping_slider.value())
-
-            kp, ki, kd, C, target_ts, target_os, ok = self.parent_dialog._tune_pid_from_ui(self.G, ctype)
+            kp, ki, kd, C, target_ts, target_os, _ = self.parent_dialog._tune_pid_from_ui(
+                self.G, ctype, self.speed_slider.value(), self.damping_slider.value())
+            self.export_btn.setEnabled(True)
 
             self.current_kp = kp
             self.current_ki = ki
@@ -2192,7 +1923,7 @@ class PIDTunerPlotDialog(QDialog):
                 pass
 
             self.ax.clear()
-            self.ax.plot(t_y, y, label="y(t)")
+            self.parent()._plot_time_mpl(self.ax, t_y, y, label="y(t)")
             self.ax.set_xlim(float(t_y[0]), float(t_y[-1]))
             self.ax.axhline(1.0, linestyle="--", linewidth=1)
             self.ax.grid(True)
@@ -2220,17 +1951,18 @@ class PIDTunerPlotDialog(QDialog):
                 f"Ki = {ki}\n"
                 f"Kd = {kd}\n\n"
 
-                f"Allowed overshoot ≤ {target_os:.4g} %\n\n"
+                f"Target overshoot: {target_os:.4g} %\n\n"
                 f"Closed-loop step_info(T):\n{step_txt}\n\n"
                 f"Closed-loop bandwidth(T) (-3 dB): {bw_txt}"
             )
 
-            if not ok:
-                txt += "\n\nOptimizer fallback used."
-
             self.info.setText(txt)
 
         except Exception as e:
+            self.export_btn.setEnabled(False)
+            self.current_kp = self.current_ki = self.current_kd = 0.0
+            for field in (self.kp_edit, self.ki_edit, self.kd_edit):
+                field.clear()
             self.ax.clear()
             self.ax.text(
                 0.05, 0.5,
@@ -2241,44 +1973,13 @@ class PIDTunerPlotDialog(QDialog):
             self.canvas.draw_idle()
             self.info.setText(f"PID tuner error: {e}")
 
-        finally:
-            # restore parent UI state
-            idx_old = self.parent_dialog.tuner_controller_type.findText(old_type)
-            if idx_old >= 0:
-                self.parent_dialog.tuner_controller_type.setCurrentIndex(idx_old)
-            self.parent_dialog.tuner_speed_slider.setValue(old_speed)
-            self.parent_dialog.tuner_damping_slider.setValue(old_damping)
-
 class PortSelectDialog(QDialog):
     def __init__(self, initial_port=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Select COM Port")
+        _load_designer_form(self, "ui/PortSelectDialog.ui")
         self.initial_port = initial_port
         self._ports = []
         self.gui_only = False
-        # Widgets
-        self.label = QLabel("Choose the serial (COM) port to use:")
-        self.combo = QComboBox()
-        self.btn_refresh = QPushButton("Refresh")
-        self.btn_gui_only = QPushButton("GUI only (no hardware)")
-        self.btn_gui_only.setToolTip(
-            "Open the interface without a Teensy/COM port.\n"
-            "Simulation, system identification data and controller design remain available;\n"
-            "serial commands are simply not sent."
-        )
-        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-
-        # Layout
-        top = QVBoxLayout()
-        row = QHBoxLayout()
-        row.addWidget(self.combo)
-        row.addWidget(self.btn_refresh)
-        top.addWidget(self.label)
-        top.addLayout(row)
-        top.addWidget(self.btn_gui_only)
-        top.addWidget(self.buttons)
-        self.setLayout(top)
-
         # Signals
         self.btn_refresh.clicked.connect(self.populate)
         self.btn_gui_only.clicked.connect(self._choose_gui_only)
@@ -2336,6 +2037,12 @@ class MyDialog(QtWidgets.QDialog):
         super(MyDialog, self).__init__(parent)
         ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "QtDesignerGUI.ui")
         uic.loadUi(ui_path, self)  # load the UI first
+        self._controller_designs = {}
+        self._design_states = {}
+        self.continuous_num_fields = [getattr(self, f"continuous_num{i}") for i in range(4, -1, -1)]
+        self.continuous_den_fields = [getattr(self, f"continuous_den{i}") for i in range(4, -1, -1)]
+        self.discrete_back_to_design.clicked.connect(lambda: self._return_to_controller_design("discrete"))
+        self.continuous_back_to_design.clicked.connect(lambda: self._return_to_controller_design("continuous"))
         self._line_edit_config_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             LINE_EDIT_CONFIG_FILENAME,
@@ -2350,6 +2057,7 @@ class MyDialog(QtWidgets.QDialog):
             "F": "0",
             "G": "0",
             "H": "0",
+            "I": "0",
             "deadzone": "0",
             "offset": "0",
             "tiemporeferencia": "2000",
@@ -2365,8 +2073,6 @@ class MyDialog(QtWidgets.QDialog):
             "x_scale": "5",
             "time_constant": "0.2",
             "reset_time": "0.5",
-            "tuner_output_min": "0",
-            "tuner_output_max": "255",
             "sampling_time": "0.02",
             "lqr_sampling": "0.02",
             "PPR": "240",
@@ -2374,11 +2080,9 @@ class MyDialog(QtWidgets.QDialog):
             "PWM_max": "255",
             "RPM_filter": "1",
         }
-        self._clear_initial_line_edits()
         self._persistent_line_edit_names = self._collect_persistent_line_edit_names()
         self._load_line_edit_config()
         self._runtime_config_values = self._default_runtime_config_values()
-        self._design_states = {}
         # ---- make the dialog look/behave like a normal resizable window ----
         flags = self.windowFlags()
         flags |= Qt.WindowType.WindowSystemMenuHint          # show system menu
@@ -2393,10 +2097,10 @@ class MyDialog(QtWidgets.QDialog):
             )
 
         # optional but useful
-        self.setSizeGripEnabled(True)      # corner size grip on some platforms
-        self.setMinimumSize(900, 600)      # pick a sane minimum so content isn’t cramped
+        _fit_designer_window(self)
 
-        base_title = "Motor DC Control - By A Von Chong"
+        base_title = self.windowTitle()
+        self._base_window_title = base_title
         self.gui_only = bool(gui_only)
         if self.gui_only:
             self.setWindowTitle(f"{base_title} — GUI only")
@@ -2407,12 +2111,15 @@ class MyDialog(QtWidgets.QDialog):
         self.serial_port = None
         self.serial_port_name = port
         self.controller_connected = False
+        self._supports_b4 = False
+        self.firmware_pwm_bits = None
         self._last_reconnect_attempt = 0.0
         self._reconnect_interval_s = 1.0
         self._serial_status_message = ""
         if port and not self.gui_only:
             try:
                 self.serial_port = serial.Serial(port, 115200, timeout=0.05, write_timeout=0.05)
+                self.serial_port.write(b"CAPS?\n")
                 self.controller_connected = True
             except Exception as e:
                 QMessageBox.critical(self, "Serial error",
@@ -2426,13 +2133,6 @@ class MyDialog(QtWidgets.QDialog):
 
         # Initialize data lists
         #self.header_written = False
-        #self.reference.setVisible(True)
-        #self.reference_label.setVisible(True)
-        #self.slider.setVisible(True)
-        #self.slider_label.setVisible(False)
-        #self.manualinput.setVisible(True)
-        #self.automaticinput.setVisible(True)
-
         datapoints = self._line_edit_int(self.datapoints, default=200, minimum=1)
         self.dataRPM_setpoint = deque(maxlen=datapoints)
         self.dataRPM_measured = deque(maxlen=datapoints)
@@ -2453,17 +2153,6 @@ class MyDialog(QtWidgets.QDialog):
             "Position - manual": "3",
         }
 
-        # Set placeholder texts (optional, but user-friendly)
-        self.snum3.setPlaceholderText("s^3")
-        self.snum2.setPlaceholderText("s^2")
-        self.snum1.setPlaceholderText("s^1")
-        self.snum0.setPlaceholderText("s^0")
-        self.sden3.setPlaceholderText("s^3")
-        self.sden2.setPlaceholderText("s^2")
-        self.sden1.setPlaceholderText("s^1")
-        self.sden0.setPlaceholderText("s^0")
-        self.sampling_time.setPlaceholderText("Ts")
-        self.lqr_sampling.setPlaceholderText("Ts")
         self._sync_sampling_lineedits()
 
         # valor inicial compartido
@@ -2472,50 +2161,6 @@ class MyDialog(QtWidgets.QDialog):
         elif self.lqr_sampling.text().strip() and not self.sampling_time.text().strip():
             self.sampling_time.setText(self.lqr_sampling.text())
 
-        self.sim_num3.setPlaceholderText("s^3")
-        self.sim_num2.setPlaceholderText("s^2")
-        self.sim_num1.setPlaceholderText("s^1")
-        self.sim_num0.setPlaceholderText("s^0")
-        self.sim_den3.setPlaceholderText("s^3")
-        self.sim_den2.setPlaceholderText("s^2")
-        self.sim_den1.setPlaceholderText("s^1")
-        self.sim_den0.setPlaceholderText("s^0")
-
-        self.cont_num3.setPlaceholderText("s^3")
-        self.cont_num2.setPlaceholderText("s^2")
-        self.cont_num1.setPlaceholderText("s^1")
-        self.cont_num0.setPlaceholderText("s^0")
-        self.plant_num3.setPlaceholderText("s^3")
-        self.plant_num2.setPlaceholderText("s^2")
-        self.plant_num1.setPlaceholderText("s^1")
-        self.plant_num0.setPlaceholderText("s^0")
-
-        self.cont_den3.setPlaceholderText("s^3")
-        self.cont_den2.setPlaceholderText("s^2")
-        self.cont_den1.setPlaceholderText("s^1")
-        self.cont_den0.setPlaceholderText("s^0")
-        self.plant_den3.setPlaceholderText("s^3")
-        self.plant_den2.setPlaceholderText("s^2")
-        self.plant_den1.setPlaceholderText("s^1")
-        self.plant_den0.setPlaceholderText("s^0")
-
-        self.rlocus_num3.setPlaceholderText("s^3")
-        self.rlocus_num2.setPlaceholderText("s^2")
-        self.rlocus_num1.setPlaceholderText("s^1")
-        self.rlocus_num0.setPlaceholderText("s^0")
-        self.rlocus_den3.setPlaceholderText("s^3")
-        self.rlocus_den2.setPlaceholderText("s^2")
-        self.rlocus_den1.setPlaceholderText("s^1")
-        self.rlocus_den0.setPlaceholderText("s^0")
-
-        self.rlocusz_num3.setPlaceholderText("z^3")
-        self.rlocusz_num2.setPlaceholderText("z^2")
-        self.rlocusz_num1.setPlaceholderText("z^1")
-        self.rlocusz_num0.setPlaceholderText("z^0")
-        self.rlocusz_den3.setPlaceholderText("z^3")
-        self.rlocusz_den2.setPlaceholderText("z^2")
-        self.rlocusz_den1.setPlaceholderText("z^1")
-        self.rlocusz_den0.setPlaceholderText("z^0")
 
         self.datapoints.textChanged.connect(self.resize_deque)
         self.modooperacion.currentIndexChanged.connect(self.sendModeOperation)
@@ -2538,7 +2183,6 @@ class MyDialog(QtWidgets.QDialog):
         self._recording_start_monotonic = None
         self._dmmout_widget = self.findChild(QtWidgets.QLineEdit, "DMMout")
         if self._dmmout_widget is not None:
-            self._dmmout_widget.setReadOnly(True)
             self._dmmout_widget.setText("DMM off")
         if hasattr(self, "DMMSync"):
             self.DMMSync.toggled.connect(self._on_dmm_sync_toggled)
@@ -2550,43 +2194,13 @@ class MyDialog(QtWidgets.QDialog):
             self.time_delimited.toggled.connect(self._on_time_delimited_toggled)
             self._on_time_delimited_toggled(self.time_delimited.isChecked())
 
-        self.grupo_identificationdata = QButtonGroup(self)
-        self.grupo_identificationdata.addButton(self.identdatagraph, 1)
-        self.grupo_identificationdata.addButton(self.identdatafile, 0)
-        self.grupo_identificationdata.setExclusive(True)
-        self.identdatagraph.setChecked(True)
-        self.identdatagraph.setVisible(False)
-        self.identdatafile.setVisible(False)
-        self.identdata.setVisible(False)
-        self.tuner_ts.setVisible(False)
-        self.tuner_ts_label.setVisible(False)
-        self.tuner_tf.setVisible(False)
-        self.tuner_tf_label.setVisible(False)
-        self.tuner_loaded_plant_label.setVisible(False)
-        self.tuner_status.setVisible(False)
-        self.tuner_control_plot.setVisible(False)
-        self.tuner_output_max.setVisible(False)
-        self.tuner_output_min.setVisible(False)
-        self.tuner_output_max_label.setVisible(False)
-        self.tuner_output_min_label.setVisible(False)
-        self.tuner_use_aw.setVisible(False)
-        self.tuner_aw_time.setVisible(False)
-        self.tuner_aw_label.setVisible(False)
-        self._last_tuner_solution = {}
 
         # Define el botón de start/stop
         self.StartStop.clicked.connect(self.toggleStartStop)
         self.isRunning = False
-        self._configure_static_ui()
 
         # Realiza la discretización
         self.discretize.clicked.connect(self.discretize_function)
-        self.prewarp_frequency.setPlaceholderText("10 rad/s")
-        self.prewarp_frequency.setToolTip(
-            "Frequency in rad/s where Tustin matches the continuous response. "
-            "Use 0 < frequency < pi/Ts; e.g. 10 rad/s."
-        )
-        self.prewarp_tustin.setToolTip("Apply frequency prewarping with the bilinear method.")
         self.method.currentTextChanged.connect(self._update_prewarp_controls)
         self.prewarp_tustin.toggled.connect(self._update_prewarp_controls)
         self._update_prewarp_controls()
@@ -2610,54 +2224,30 @@ class MyDialog(QtWidgets.QDialog):
         # Open big plots when user clicks the thumbnail plots
         self.canvas_rl.mpl_connect("button_press_event", self._on_rlocus_canvas_click)
 
-        # Ensure the placeholder widget is inside a layout
-        # El widget para la gráfica había que meterlo dentro de un recipiente (layout)
-        # El widget se llama RPM y aquí se asegura que tiene uno asociado
-        placeholderLayoutRPM = self.RPM.parentWidget().layout()
-        placeholderLayoutPWM = self.PWM.parentWidget().layout()
-        placeholderLayoutforced_response = self.forced_response.parentWidget().layout()
-        placeholderLayoutsim_response = self.sim_response.parentWidget().layout()
-
-        self.graphWidgetRPM = pg.PlotWidget()
-
+        # Plot widgets are instantiated by uic from the Designer form.
         pi = self.graphWidgetRPM.getPlotItem()
         self.legendRPM = pi.addLegend()
         self.legendRPM.setParentItem(pi.vb)
         self.legendRPM.anchor(itemPos=(1,0), parentPos=(1,0), offset=(10, -10))
-
-        pi = self.graphWidgetRPM.getPlotItem()
-        pi.setLabel('left',   'Motor Input / Output', units='PWM / RPM')
+        pi.setLabel('left', 'Motor Input / Output', units='PWM / RPM')
         self.graphWidgetRPM.setYRange(0, 120)
-        placeholderLayoutRPM.replaceWidget(self.RPM, self.graphWidgetRPM)
-        self.RPM.deleteLater()
 
-        self.graphWidgetPWM = pg.PlotWidget()
-        piSETPOINT = self.graphWidgetPWM.getPlotItem()
-        self.legendPWM = piSETPOINT.addLegend()
-        self.legendPWM.setParentItem(piSETPOINT.vb)
-        self.legendPWM.anchor(itemPos=(1,0), parentPos=(1,0), offset=(10, -10))
         pi = self.graphWidgetPWM.getPlotItem()
-        pi.setLabel('left',   'uController output', units='PWM')
-        pi.setLabel('bottom', 'Time',  units='s')
+        self.legendPWM = pi.addLegend()
+        self.legendPWM.setParentItem(pi.vb)
+        self.legendPWM.anchor(itemPos=(1,0), parentPos=(1,0), offset=(10, -10))
+        pi.setLabel('left', 'uController output', units='PWM')
+        pi.setLabel('bottom', 'Time', units='s')
         self.graphWidgetPWM.setYRange(0, 255)
-        placeholderLayoutPWM.replaceWidget(self.PWM, self.graphWidgetPWM)
-        self.PWM.deleteLater()
-
-        self.graphWidgetforced_response = pg.PlotWidget()
         self.graphWidgetforced_response.setYRange(0, 1.2)
-        placeholderLayoutforced_response.replaceWidget(self.forced_response, self.graphWidgetforced_response)
-        self.forced_response.deleteLater()
-
-        self.graphWidgetsim_response = pg.PlotWidget()
         self.graphWidgetsim_response.setYRange(0, 1.2)
-        placeholderLayoutsim_response.replaceWidget(self.sim_response, self.graphWidgetsim_response)
-        self.sim_response.deleteLater()
 
         # Initialize curves for fast updates
         self.graphWidgetPWM.setXLink(self.graphWidgetRPM)
-        self.curve_setpoint = self.graphWidgetRPM.plot(name="Input", pen=pg.mkPen(color='b', width=3, style=QtCore.Qt.PenStyle.SolidLine))  # Blue line for setpoint
-        self.curve_measured = self.graphWidgetRPM.plot(name="Output", pen=pg.mkPen(color='r', width=3, style=QtCore.Qt.PenStyle.SolidLine))  # Red line for measured
-        self.curve_pwm = self.graphWidgetPWM.plot(name="PWM", pen=pg.mkPen(color='g', width=3, style=QtCore.Qt.PenStyle.SolidLine))       # Green line for PWM
+        self.curve_setpoint = self._plot_time_pg(self.graphWidgetRPM, name="Input", pen=pg.mkPen(color='b', width=3, style=QtCore.Qt.PenStyle.SolidLine))  # Blue line for setpoint
+        self.curve_measured = self._plot_time_pg(self.graphWidgetRPM, name="Output", pen=pg.mkPen(color='r', width=3, style=QtCore.Qt.PenStyle.SolidLine))  # Red line for measured
+        self.curve_pwm = self._plot_time_pg(self.graphWidgetPWM, name="PWM", pen=pg.mkPen(color='g', width=3, style=QtCore.Qt.PenStyle.SolidLine))       # Green line for PWM
+        self.modo_plot.currentTextChanged.connect(self._on_plot_mode_changed)
         self._set_runtime_plot_interaction(enabled=True)
 
         # Disconnect the standard dialog accept/reject slots
@@ -2680,11 +2270,12 @@ class MyDialog(QtWidgets.QDialog):
         # read from _line_edit_default_values when a field is blank.
         self.modooperacion.setCurrentIndex(0)
         self.tabWidget.blockSignals(True)
-        self.tabWidget.setCurrentIndex(0)
+        self.tabWidget.setCurrentWidget(self.tab)
         self.tabWidget.blockSignals(False)
         self._sync_reference_slider_to_line_edit()
         self._update_reference_controls_visibility()
         self._connect_line_edit_config_saves()
+        self._connect_continuous_controller_signals()
 
         if self.gui_only:
             self.textBrowser.setText("GUI only — no hardware connected, commands are not sent")
@@ -2694,6 +2285,8 @@ class MyDialog(QtWidgets.QDialog):
         self.timerHora.start()
 
     def _show_controller_disconnected(self, reason=None):
+        self._supports_b4 = False
+        self.firmware_pwm_bits = None
         if self.serial_port is not None:
             try:
                 self.serial_port.close()
@@ -2738,7 +2331,10 @@ class MyDialog(QtWidgets.QDialog):
                 self.serial_port = serial.Serial(port, 115200, timeout=0.05, write_timeout=0.05)
                 self.serial_port_name = port
                 self.serial_port.reset_input_buffer()
-                self.setWindowTitle(f"Motor DC Control - By A Von Chong — {port}")
+                self._supports_b4 = False
+                self.firmware_pwm_bits = None
+                self.serial_port.write(b"CAPS?\n")
+                self.setWindowTitle(f"{self._base_window_title} — {port}")
                 self._show_controller_connected()
                 return True
             except Exception:
@@ -2747,48 +2343,149 @@ class MyDialog(QtWidgets.QDialog):
         self.textBrowser.setText("Controlador desconectado, esperando reconexión")
         return False
 
-    def _configure_static_ui(self):
-        self.tabWidget.setUsesScrollButtons(True)
-        tab_bar = self.tabWidget.tabBar()
-        tab_bar.setStyleSheet("""
-            QTabBar::scroller {
-                width: 60px;
-            }
-            QTabBar QToolButton {
-                min-width: 30px;
-                min-height: 30px;
-                padding: 2px;
-                margin: 0 2px;
-                border: 1px solid #c8ced8;
-                border-radius: 5px;
-                background: #f6f7f9;
-            }
-            QTabBar QToolButton:hover {
-                background: #e9eef7;
-            }
-            QTabBar QToolButton:pressed {
-                background: #dbe4f2;
-            }
-        """)
 
-        font = self.StartStop.font()
-        font.setBold(True)
-        self.StartStop.setFont(font)
+    def _connect_continuous_controller_signals(self):
+        for field in self.continuous_num_fields + self.continuous_den_fields:
+            field.textChanged.connect(self._refresh_continuous_controller)
+        self.delay.textChanged.connect(self._refresh_continuous_controller)
+        self._refresh_continuous_controller()
 
-        self._style_tab_scroll_buttons()
-        QTimer.singleShot(0, self._style_tab_scroll_buttons)
+    def _read_continuous_controller(self):
+        def polynomial(fields):
+            try:
+                values = [float((self._coefficient_text(field).strip() or "0").replace(",", "."))
+                          for field in fields]
+            except ValueError:
+                raise ValueError("Enter numeric controller coefficients.") from None
+            if not np.all(np.isfinite(values)):
+                raise ValueError("Controller coefficients must be finite.")
+            while len(values) > 1 and values[0] == 0:
+                values.pop(0)
+            return values
+        num = polynomial(self.continuous_num_fields)
+        den = polynomial(self.continuous_den_fields)
+        if not any(den):
+            raise ValueError("Enter a nonzero controller denominator.")
+        controller = ctrl.tf(num, den)
+        continuous_controller_coefficients(controller)
+        return controller
 
-    def _style_tab_scroll_buttons(self):
-        tab_bar = self.tabWidget.tabBar()
-        for button in tab_bar.findChildren(QtWidgets.QToolButton):
-            button.setMinimumSize(30, 30)
-            button.setIconSize(QtCore.QSize(18, 18))
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setAutoRaise(False)
+    def _continuous_controller_period(self):
+        try:
+            milliseconds = float(str(self.delay.text().strip() or self._line_edit_default(self.delay)).replace(",", "."))
+        except (ValueError, TypeError):
+            raise ValueError("Enter a sampling time in whole milliseconds.") from None
+        period = milliseconds / 1000
+        deployment_period_ms(period)
+        return period
 
-    def _clear_initial_line_edits(self):
-        for line_edit in self.findChildren(QtWidgets.QLineEdit):
-            line_edit.clear()
+    def _prepare_continuous_controller(self, controller):
+        period = self._continuous_controller_period()
+        discrete = discretize_continuous_controller(controller, period)
+        numerator, feedback = deployment_coefficients(discrete)
+        if numerator[4] != 0 and not self.gui_only and not self._supports_b4:
+            raise ValueError("Firmware has not confirmed B4 support. Update/connect it before using this controller.")
+        return numerator, feedback
+
+    def _refresh_continuous_controller(self, *_):
+        self.continuous_period.setText(self.delay.text().strip() or str(self._line_edit_default(self.delay)))
+        if not any(self._coefficient_text(field).strip()
+                   for field in self.continuous_num_fields + self.continuous_den_fields):
+            self.continuous_display.clear()
+            return
+        try:
+            controller = self._read_continuous_controller()
+            self.continuous_display.setPlainText(self.tf_to_pretty_str(controller, decimals=2))
+        except (ValueError, TypeError, OverflowError) as exc:
+            self.continuous_display.setPlainText(str(exc))
+
+    def _import_continuous_controller(self, controller):
+        num, den = continuous_controller_coefficients(controller)
+        self._prepare_continuous_controller(controller)  # validate before changing any fields
+        was_loading = self._line_edit_config_loading
+        self._line_edit_config_loading = True
+        try:
+            for fields, values in ((self.continuous_num_fields, num), (self.continuous_den_fields, den)):
+                for field, value in zip(fields, np.pad(values, (5 - len(values), 0))):
+                    with QtCore.QSignalBlocker(field):
+                        field.setText(f"{value:.17g}")
+            with QtCore.QSignalBlocker(self.tabWidget):
+                self.tabWidget.setCurrentWidget(self.Continuous)
+        finally:
+            self._line_edit_config_loading = was_loading
+        self._refresh_continuous_controller()
+        self._save_line_edit_config()
+        return self.toggleupdate_parameters()
+
+    def _update_design_return_buttons(self):
+        for kind, button in (("continuous", self.continuous_back_to_design),
+                             ("discrete", self.discrete_back_to_design)):
+            available = kind in self._controller_designs
+            button.setEnabled(available)
+            button.setToolTip("Return to this controller's exported design, including its plant and gain."
+                              if available else "Export a controller from a root locus design first.")
+
+    def _remember_controller_design(self, kind, designer):
+        num, den = tf_num_den(designer.base_sys)
+        period = float(designer.Ts) if kind == "discrete" else None
+        self._controller_designs[kind] = {
+            "plant_num": num.tolist(), "plant_den": den.tolist(),
+            "period": period, "state": deepcopy(designer.get_state()),
+        }
+        extra = (round(period, 12),) if period is not None else ()
+        key = design_state_key(kind, designer.base_sys, extra=extra)
+        self._design_states[key] = deepcopy(self._controller_designs[kind]["state"])
+        self._update_design_return_buttons()
+        self._save_line_edit_config()
+
+    def _return_to_controller_design(self, kind):
+        saved = self._controller_designs.get(kind)
+        if saved is None:
+            return
+        dialog = None
+        try:
+            period = float(saved["period"]) if kind == "discrete" else None
+            plant = ctrl.tf(saved["plant_num"], saved["plant_den"], period if period is not None else 0)
+            num, den = tf_num_den(plant)
+            if len(num) > 4 or len(den) > 4:
+                raise ValueError("The source plant exceeds the design page's polynomial order.")
+            if kind == "continuous":
+                prefix, page = "rlocus", self.tab_6
+            else:
+                prefix, page = "rlocusz", self.tab_8
+            was_loading = self._line_edit_config_loading
+            self._line_edit_config_loading = True
+            try:
+                for suffix, values in (("num", num), ("den", den)):
+                    for power, value in zip(range(3, -1, -1), np.pad(values, (4 - len(values), 0))):
+                        field = getattr(self, f"{prefix}_{suffix}{power}")
+                        with QtCore.QSignalBlocker(field):
+                            field.setText(f"{value:.17g}")
+                if period is not None:
+                    for field in (self.lqr_sampling, self.sampling_time):
+                        with QtCore.QSignalBlocker(field):
+                            field.setText(f"{period:.17g}")
+                # Navigation must not send a new active-tab command to the motor.
+                with QtCore.QSignalBlocker(self.tabWidget):
+                    self.tabWidget.setCurrentWidget(page)
+            finally:
+                self._line_edit_config_loading = was_loading
+            if kind == "continuous":
+                self.update_analysis_plots()
+                dialog = ControlPlotDialog(self, plant, state=deepcopy(saved["state"]))
+            else:
+                self.update_discrete_rlocus_plots()
+                dialog = DiscreteControlPlotDialog(self, plant, period, state=deepcopy(saved["state"]))
+            dialog.exec()
+            extra = (round(period, 12),) if period is not None else ()
+            self._design_states[design_state_key(kind, plant, extra=extra)] = dialog.get_state()
+            self._save_line_edit_config()
+        except (ValueError, TypeError, KeyError) as exc:
+            self.textBrowser.setText(f"Could not restore controller design: {exc}")
+        finally:
+            if dialog is not None:
+                dialog.deleteLater()
+
 
     def _collect_persistent_line_edit_names(self):
         excluded = {
@@ -2802,8 +2499,6 @@ class MyDialog(QtWidgets.QDialog):
             "tuner_kp",
             "tuner_ki",
             "tuner_kd",
-            "tuner_tf",
-            "tuner_ts",
         }
         names = []
         for line_edit in self.findChildren(QtWidgets.QLineEdit):
@@ -2836,6 +2531,15 @@ class MyDialog(QtWidgets.QDialog):
                 if isinstance(widget, QtWidgets.QLineEdit):
                     value = values[name]
                     widget.setText("" if value is None else str(value))
+            designs = data.get("controller_designs", {})
+            if isinstance(designs, dict):
+                for kind in ("continuous", "discrete"):
+                    saved = designs.get(kind)
+                    if (isinstance(saved, dict) and isinstance(saved.get("state"), dict)
+                            and "plant_num" in saved and "plant_den" in saved
+                            and (kind == "continuous" or saved.get("period") is not None)):
+                        self._controller_designs[kind] = deepcopy(saved)
+            self._update_design_return_buttons()
         finally:
             self._line_edit_config_loading = False
 
@@ -2853,11 +2557,12 @@ class MyDialog(QtWidgets.QDialog):
         for name in self._persistent_line_edit_names:
             widget = getattr(self, name, None)
             if isinstance(widget, QtWidgets.QLineEdit):
-                values[name] = widget.text()
+                values[name] = self._coefficient_text(widget)
 
         data = {
             "version": 1,
             "line_edits": values,
+            "controller_designs": self._controller_designs,
         }
 
         tmp_path = f"{self._line_edit_config_path}.tmp"
@@ -2869,6 +2574,10 @@ class MyDialog(QtWidgets.QDialog):
         except Exception as e:
             print(f"Could not save GUI config: {e}")
 
+    @staticmethod
+    def _coefficient_text(widget):
+        return widget.rawText() if isinstance(widget, CoefficientEdit) else widget.text()
+
     def _line_edit_default(self, widget, fallback=0.0):
         name = widget.objectName() if hasattr(widget, "objectName") else ""
         return self._line_edit_default_values.get(name, fallback)
@@ -2877,7 +2586,7 @@ class MyDialog(QtWidgets.QDialog):
         if default is None:
             default = self._line_edit_default(widget, 0.0)
 
-        text = widget.text().strip() if hasattr(widget, "text") else str(widget).strip()
+        text = self._coefficient_text(widget).strip() if hasattr(widget, "text") else str(widget).strip()
         raw_value = text if text else default
         try:
             value = float(str(raw_value).replace(",", "."))
@@ -2987,7 +2696,7 @@ class MyDialog(QtWidgets.QDialog):
     def _on_test_duration_elapsed(self):
         if self.isRunning:
             self.isRunning = False
-            self.StartStop.setText("Start")
+            self.StartStop.setText("START")
             self.StopAction()
         if self.saveValuesCheckBox.isChecked():
             self.saveValuesCheckBox.setChecked(False)
@@ -3087,6 +2796,45 @@ class MyDialog(QtWidgets.QDialog):
     def _runtime_plot_widgets(self):
         return (self.graphWidgetRPM, self.graphWidgetPWM)
 
+    def _time_plot_is_zoh(self):
+        return self.modo_plot.currentText().strip().upper() == "ZOH"
+
+    def _pg_step_mode(self):
+        # In PyQtGraph 0.13, 'right' holds y[k] through x[k+1], like stairs.
+        return "right" if self._time_plot_is_zoh() else None
+
+    def _mpl_drawstyle(self):
+        return "steps-post" if self._time_plot_is_zoh() else "default"
+
+    def _plot_time_pg(self, widget, *args, **kwargs):
+        return widget.plot(*args, stepMode=self._pg_step_mode(), **kwargs)
+
+    def _plot_time_mpl(self, axes, *args, **kwargs):
+        lines = axes.plot(*args, drawstyle=self._mpl_drawstyle(), **kwargs)
+        for line in lines:
+            line.set_gid("time-series")
+        return lines
+
+    def _on_plot_mode_changed(self, _text=None):
+        # Restyle the original samples; no acquisition, fitting or simulation runs.
+        for widget in (self.graphWidgetRPM, self.graphWidgetPWM,
+                       self.graphWidgetforced_response, self.graphWidgetsim_response):
+            for curve in widget.listDataItems():
+                x, y = curve.getOriginalDataset()
+                if x is None or y is None:
+                    x, y = [], []
+                curve.setData(x, y, stepMode=self._pg_step_mode())
+        # Includes response plots in enlarged dialogs parented to the main GUI.
+        for canvas in self.findChildren(FigureCanvas):
+            changed = False
+            for axes in canvas.figure.axes:
+                for line in axes.lines:
+                    if line.get_gid() == "time-series":
+                        line.set_drawstyle(self._mpl_drawstyle())
+                        changed = True
+            if changed:
+                canvas.draw_idle()
+
     def _set_runtime_plot_interaction(self, enabled):
         for plot_widget in self._runtime_plot_widgets():
             plot_item = plot_widget.getPlotItem()
@@ -3127,7 +2875,6 @@ class MyDialog(QtWidgets.QDialog):
         for widget in (self.reference, self.reference_label, self.slider):
             widget.setVisible(True)
 
-        self.slider_label.setVisible(False)
 
     def _on_reference_source_changed(self, checked=False):
         self._update_reference_controls_visibility()
@@ -3216,7 +2963,7 @@ class MyDialog(QtWidgets.QDialog):
 
             # Clear and plot the new response
             self.graphWidgetsim_response.clear()
-            self.graphWidgetsim_response.plot(t, y, pen='y', name=response_type.capitalize() + " Response")
+            self._plot_time_pg(self.graphWidgetsim_response, t, y, pen='y', name=response_type.capitalize() + " Response")
             # Auto-scale Y-axis
             ymin, ymax = np.min(y), np.max(y)
             margin = (ymax - ymin) * 0.1 if ymax != ymin else 0.1  # Add 10% margin
@@ -3234,12 +2981,12 @@ class MyDialog(QtWidgets.QDialog):
         den = []
 
         for w in num_widgets:
-            txt = w.text().strip()
-            num.append(float(txt) if txt else 0.0)
+            txt = self._coefficient_text(w).strip()
+            num.append(float(txt.replace(",", ".")) if txt else 0.0)
 
         for w in den_widgets:
-            txt = w.text().strip()
-            den.append(float(txt) if txt else 0.0)
+            txt = self._coefficient_text(w).strip()
+            den.append(float(txt.replace(",", ".")) if txt else 0.0)
 
         num = self._strip_leading_zeros(num)
         den = self._strip_leading_zeros(den)
@@ -3415,26 +3162,11 @@ class MyDialog(QtWidgets.QDialog):
         return ctrl.TransferFunction(num, den, Ts)
 
     def _setup_discrete_rlocus_tab_plots(self):
-        fig_zrl = Figure(figsize=(4, 3), tight_layout=True)
-        self.canvas_zrl = FigureCanvas(fig_zrl)
-        self.ax_zrl = fig_zrl.add_subplot(111)
-
-        fig_zstep = Figure(figsize=(4, 3), tight_layout=True)
-        self.canvas_zstep = FigureCanvas(fig_zstep)
-        self.ax_zstep = fig_zstep.add_subplot(111)
-
-        def _replace_in_parent_layout(placeholder_widget, new_widget):
-            parent = placeholder_widget.parentWidget()
-            if parent is None or parent.layout() is None:
-                raise RuntimeError(
-                    f"Placeholder '{placeholder_widget.objectName()}' has no parent layout."
-                )
-            parent.layout().replaceWidget(placeholder_widget, new_widget)
-            placeholder_widget.setParent(None)
-            placeholder_widget.deleteLater()
-
-        _replace_in_parent_layout(self.unitcircle_rlocus, self.canvas_zrl)
-        _replace_in_parent_layout(self.response_rlocus, self.canvas_zstep)
+        for canvas in (self.canvas_zrl, self.canvas_zstep):
+            canvas.figure.set_size_inches(4, 3)
+            canvas.figure.set_layout_engine("tight")
+        self.ax_zrl = self.canvas_zrl.figure.add_subplot(111)
+        self.ax_zstep = self.canvas_zstep.figure.add_subplot(111)
 
         self._analysis_z_timer = QTimer(self)
         self._analysis_z_timer.setSingleShot(True)
@@ -3525,7 +3257,7 @@ class MyDialog(QtWidgets.QDialog):
             except Exception:
                 pass
 
-            self.ax_zstep.plot(t, y)
+            self._plot_time_mpl(self.ax_zstep, t, y)
             self.ax_zstep.axhline(1.0, linestyle="--", linewidth=1)
             self.ax_zstep.grid(True)
             self.ax_zstep.set_xlim(float(t[0]), float(t[-1]))
@@ -3587,20 +3319,10 @@ class MyDialog(QtWidgets.QDialog):
         self.lqr_sampling.textChanged.connect(copy_b_to_a)
 
     def _setup_pid_tuner(self):
-        self.tuner_speed_slider.setRange(0, 100)
-        self.tuner_speed_slider.setValue(50)
-
-        self.tuner_damping_slider.setRange(0, 100)
-        self.tuner_damping_slider.setValue(60)
-
         if hasattr(self, "tuner_speed_value"):
             self.tuner_speed_value.setText(str(self.tuner_speed_slider.value()))
         if hasattr(self, "tuner_damping_value"):
             self.tuner_damping_value.setText(str(self.tuner_damping_slider.value()))
-
-        self.tuner_kp.setReadOnly(True)
-        self.tuner_ki.setReadOnly(True)
-        self.tuner_kd.setReadOnly(True)
 
         self._setup_pid_tuner_plots()
 
@@ -3645,12 +3367,9 @@ class MyDialog(QtWidgets.QDialog):
             self.open_big_zrlocus()
 
     def _setup_pid_tuner_plots(self):
-        layout_step = self.tuner_step_plot.parentWidget().layout()
-        self.tuner_step_fig = Figure(constrained_layout=True)
+        self.tuner_step_fig = self.tuner_step_canvas.figure
+        self.tuner_step_fig.set_layout_engine("constrained")
         self.tuner_step_ax = self.tuner_step_fig.add_subplot(111)
-        self.tuner_step_canvas = FigureCanvas(self.tuner_step_fig)
-        layout_step.replaceWidget(self.tuner_step_plot, self.tuner_step_canvas)
-        self.tuner_step_plot.deleteLater()
 
         self.tuner_step_canvas.mpl_connect(
         "button_press_event",
@@ -3669,10 +3388,13 @@ class MyDialog(QtWidgets.QDialog):
 
         self.open_big_pid_tuner_step()
 
-    def _clear_pid_tuner_plots(self):
+    def _clear_pid_tuner_plots(self, error=None):
         self.tuner_step_ax.clear()
         self.tuner_step_ax.grid(True)
         self.tuner_step_ax.set_title("Closed-loop step response")
+        if error:
+            self.tuner_step_ax.text(.05, .5, str(error), transform=self.tuner_step_ax.transAxes,
+                                    wrap=True, va="center")
         self.tuner_step_canvas.draw_idle()
 
     def _get_tuner_plant(self):
@@ -3724,54 +3446,11 @@ class MyDialog(QtWidgets.QDialog):
             self.tuner_kp.setText("")
             self.tuner_ki.setText("")
             self.tuner_kd.setText("")
-            self._clear_pid_tuner_plots()
+            self._clear_pid_tuner_plots(f"Load plant error: {e}")
             print(f"Load plant error: {e}")
 
-    def _estimate_time_scale(self, G):
-        poles = ctrl.poles(G)
-        stable_real_parts = [p.real for p in poles if p.real < -1e-9]
-
-        if len(stable_real_parts) == 0:
-            return 0.2
-
-        slowest = min(abs(r) for r in stable_real_parts)
-        tau = 1.0 / slowest
-        return max(1e-3, tau)
-
     def _pid_tuner_derivative_filter_time(self):
-        try:
-            Tf = self._line_edit_float(self.time_constant, default=0.2)
-        except Exception:
-            Tf = 0.008
-        return max(Tf, 1e-6)
-
-    def _make_parallel_pid(self, ctype, kp, ki, kd):
-        s = ctrl.TransferFunction.s
-        ctype = ctype.upper()
-
-        # Match the derivative filter used by the firmware PID implementation.
-        Tf = self._pid_tuner_derivative_filter_time()
-
-        if ctype == "P":
-            C = ctrl.TransferFunction([kp], [1])
-
-        elif ctype == "PI":
-            C = kp + ki / s
-
-        elif ctype == "PD":
-            # Simulate as PDF internally
-            Df = (kd * s) / (1 + Tf * s)
-            C = kp + Df
-
-        elif ctype == "PID":
-            # Simulate as PIDF internally
-            Df = (kd * s) / (1 + Tf * s)
-            C = kp + ki / s + Df
-
-        else:
-            raise ValueError(f"Unsupported controller type: {ctype}")
-
-        return ctrl.minreal(C, verbose=False)
+        return self._line_edit_float(self.time_constant, default=0.2, minimum=1e-6)
 
     def _update_pid_tuner(self):
         if self.tuner_loaded_plant is None:
@@ -3785,7 +3464,7 @@ class MyDialog(QtWidgets.QDialog):
             G = self._get_tuner_plant()
             ctype = self.tuner_controller_type.currentText().strip().upper()
 
-            kp, ki, kd, C, target_ts, target_os, ok = self._tune_pid_from_ui(G, ctype)
+            kp, ki, kd, C, target_ts, target_os, _ = self._tune_pid_from_ui(G, ctype)
 
             self.tuner_kp.setText(f"{kp:.6g}")
             self.tuner_ki.setText(f"{ki:.6g}")
@@ -3810,7 +3489,7 @@ class MyDialog(QtWidgets.QDialog):
                 pass
 
             self.tuner_step_ax.clear()
-            self.tuner_step_ax.plot(t_y, y, label="y(t)")
+            self._plot_time_mpl(self.tuner_step_ax, t_y, y, label="y(t)")
             self.tuner_step_ax.axhline(1.0, linestyle="--", linewidth=1)
             self.tuner_step_ax.grid(True)
             self.tuner_step_ax.set_title("Closed-loop step response")
@@ -3823,178 +3502,16 @@ class MyDialog(QtWidgets.QDialog):
             self.tuner_kp.setText("")
             self.tuner_ki.setText("")
             self.tuner_kd.setText("")
-            self._clear_pid_tuner_plots()
+            self._clear_pid_tuner_plots(f"PID tuner error: {e}")
             if hasattr(self, "tuner_status"):
                 self.tuner_status.setText(f"PID tuner error: {e}")
 
-    def _initial_guess_from_plant(self, G, ctype):
-        try:
-            kdc = float(np.real(ctrl.dcgain(G)))
-        except Exception:
-            kdc = 1.0
-
-        if not np.isfinite(kdc) or abs(kdc) < 1e-9:
-            kdc = 1.0
-
-        tau = self._estimate_time_scale(G)
-
-        kp0 = max(1e-3, 1.0 / abs(kdc))
-        ki0 = max(1e-3, kp0 / max(tau, 1e-3))
-        kd0 = max(1e-5, 0.1 * kp0 * tau)
-
-        ctype = ctype.upper()
-        if ctype == "P":
-            return np.array([np.log10(kp0)])
-        elif ctype == "PI":
-            return np.array([np.log10(kp0), np.log10(ki0)])
-        elif ctype == "PD":
-            return np.array([np.log10(kp0), np.log10(kd0)])
-        elif ctype == "PID":
-            return np.array([np.log10(kp0), np.log10(ki0), np.log10(kd0)])
-        else:
-            raise ValueError("Invalid controller type")
-
-    def _target_specs_from_sliders(self, G):
-        tau = self._estimate_time_scale(G)
-
-        speed = self.tuner_speed_slider.value() / 100.0
-        damping = self.tuner_damping_slider.value() / 100.0
-
-        target_ts = tau * (15.0 - 14.5 * speed)
-        target_ts = max(0.03, target_ts)
-
-        target_os = 35.0 * (1.0 - damping)
-        target_os = max(0.0, min(35.0, target_os))
-
-        return target_ts, target_os
-
-    def _controller_params_from_x(self, x, ctype):
-        vals = 10 ** np.array(x)
-        ctype = ctype.upper()
-
-        kp = ki = kd = 0.0
-
-        if ctype == "P":
-            kp = vals[0]
-        elif ctype == "PI":
-            kp, ki = vals
-        elif ctype == "PD":
-            kp, kd = vals
-        elif ctype == "PID":
-            kp, ki, kd = vals
-
-        return float(kp), float(ki), float(kd)
-
-    def _cost_pid_tuner(self, x, G, ctype, target_ts, target_os):
-        try:
-            kp, ki, kd = self._controller_params_from_x(x, ctype)
-            C = self._make_parallel_pid(ctype, kp, ki, kd)
-
-            T = ctrl.feedback(C * G, 1)
-
-            t_final = max(2.0, 8.0 * target_ts)
-            t = np.linspace(0, t_final, 800)
-
-            t_y, y = ctrl.step_response(T, T=t)
-
-            if not np.all(np.isfinite(y)):
-                return 1e12
-
-            info = ctrl.step_info(T)
-
-            ts = float(info.get("SettlingTime", np.inf))
-            os = float(info.get("Overshoot", 1e6))
-            yfin = float(y[-1]) if len(y) else np.nan
-
-            if not np.isfinite(ts):
-                ts = 10 * t_final
-            if not np.isfinite(os):
-                os = 1e6
-            if not np.isfinite(yfin):
-                return 1e12
-
-            ess = abs(1.0 - yfin)
-
-            J = 0.0
-            J += 4.0 * ((ts - target_ts) / max(target_ts, 1e-3)) ** 2
-            J += 1.5 * ((max(0.0, os - target_os)) / max(5.0, target_os + 1.0)) ** 2
-            J += 8.0 * ess ** 2
-
-            # ----- normalized gain penalties -----
-            x_ref = self._initial_guess_from_plant(G, ctype)
-            kp_ref, ki_ref, kd_ref = self._controller_params_from_x(x_ref, ctype)
-
-            kp_ref = max(kp_ref, 1e-6)
-            ki_ref = max(ki_ref, 1e-6)
-            kd_ref = max(kd_ref, 1e-6)
-
-            ctype_u = ctype.upper()
-
-            if ctype_u == "P":
-                J += 1.365 * (kp / kp_ref) ** 2
-
-            elif ctype_u == "PI":
-                J += 0.03 * (kp / kp_ref) ** 2
-                J += 0.003 * (ki / ki_ref) ** 2
-
-                # Soft penalty against almost-zero proportional action
-                kp_min_pref = 0.35 * kp_ref
-                if kp < kp_min_pref:
-                    J += 10.0 * ((kp_min_pref - kp) / kp_ref) ** 2
-
-            elif ctype_u == "PD":
-                J += 0.04 * (kp / kp_ref) ** 2
-                J += 0.01 * (kd / kd_ref) ** 2
-
-            elif ctype_u == "PID":
-                J += 0.03 * (kp / kp_ref) ** 2
-                J += 0.003 * (ki / ki_ref) ** 2
-                J += 0.01 * (kd / kd_ref) ** 2
-
-                kp_min_pref = 0.25 * kp_ref
-                if kp < kp_min_pref:
-                    J += 8.0 * ((kp_min_pref - kp) / kp_ref) ** 2
-
-            if np.max(np.abs(y)) > 50:
-                J += 1e6
-
-            return float(J)
-
-        except Exception:
-            return 1e12
-
-    def _tune_pid_from_ui(self, G, ctype):
-        target_ts, target_os = self._target_specs_from_sliders(G)
-
-        # Default initial guess from plant
-        x0 = self._initial_guess_from_plant(G, ctype)
-
-        # Warm start from previous solution for the same controller type
-        if ctype in self._last_tuner_solution:
-            try:
-                x_prev = self._last_tuner_solution[ctype]
-                if len(x_prev) == len(x0):
-                    x0 = np.array(x_prev, dtype=float)
-            except Exception:
-                pass
-
-        res = minimize(
-            self._cost_pid_tuner,
-            x0,
-            args=(G, ctype, target_ts, target_os),
-            method="Nelder-Mead",
-            options={"maxiter": 250, "xatol": 1e-2, "fatol": 1e-3},
-        )
-
-        x_best = res.x if res.success else x0
-
-        # Save for continuity in nearby slider positions
-        self._last_tuner_solution[ctype] = np.array(x_best, dtype=float)
-
-        kp, ki, kd = self._controller_params_from_x(x_best, ctype)
-        C = self._make_parallel_pid(ctype, kp, ki, kd)
-
-        return kp, ki, kd, C, target_ts, target_os, res.success
+    def _tune_pid_from_ui(self, G, ctype, speed_value=None, damping_value=None):
+        speed = self.tuner_speed_slider.value() if speed_value is None else speed_value
+        damping = self.tuner_damping_slider.value() if damping_value is None else damping_value
+        result = tune_pid(G, ctype, speed, damping, self._pid_tuner_derivative_filter_time())
+        return (result.kp, result.ki, result.kd, result.controller,
+                result.target_settling_time, result.target_overshoot, True)
 
     def reduceTF(self):
         def _f(le):
@@ -4028,9 +3545,11 @@ class MyDialog(QtWidgets.QDialog):
 
             # Basic sanity checks
             if all(abs(x) < 1e-12 for x in c_den):
+                self.series_tf.clear()
                 self.equivalent_tf.setText("Error: Controller denominator is all zeros.")
                 return
             if all(abs(x) < 1e-12 for x in g_den):
+                self.series_tf.clear()
                 self.equivalent_tf.setText("Error: Plant denominator is all zeros.")
                 return
 
@@ -4041,25 +3560,17 @@ class MyDialog(QtWidgets.QDialog):
             L = ctrl.series(C, G)
             T = ctrl.feedback(L, 1, sign=-1)  # negative feedback
 
-            # Pretty output (and also raw coefficient lists)
-            num = np.asarray(T.num[0][0], dtype=float)
-            den = np.asarray(T.den[0][0], dtype=float)
-
-            out = []
-            out.append("Series reduction:")
-            out.append(self.tf_to_pretty_str(L))
-            out.append("\nEquivalent system:")
-            out.append(self.tf_to_pretty_str(T))
-            self.equivalent_tf.setText("\n".join(out))
-
+            self.series_tf.setPlainText(self.tf_to_pretty_str(L))
+            self.equivalent_tf.setPlainText(self.tf_to_pretty_str(T))
 
         except Exception as e:
+            self.series_tf.clear()
             self.equivalent_tf.setText(f"Error reducing block diagram: {e}")
 
-    def tf_to_pretty_str(self, sys, var='s', digits=6, eps=1e-12):
+    def tf_to_pretty_str(self, sys, var='s', digits=6, eps=1e-12, decimals=None):
         """Return only the transfer function fraction (no sys[..], no I/O labels)."""
-        num = np.asarray(sys.num[0][0], dtype=float)
-        den = np.asarray(sys.den[0][0], dtype=float)
+        num = np.asarray(sys.num[0][0], dtype=float).copy()
+        den = np.asarray(sys.den[0][0], dtype=float).copy()
 
         num[np.abs(num) < eps] = 0.0
         den[np.abs(den) < eps] = 0.0
@@ -4071,7 +3582,7 @@ class MyDialog(QtWidgets.QDialog):
                 p = n - i
                 if abs(a) < eps:
                     continue
-                a_str = f"{a:.{digits}g}"
+                a_str = f"{a:.{digits}g}" if decimals is None else f"{a:.{decimals}f}"
 
                 if p == 0:
                     terms.append(f"{a_str}")
@@ -4629,8 +4140,8 @@ class MyDialog(QtWidgets.QDialog):
     def _read_float(self, le):
         """Read float from QLineEdit. Empty/invalid -> 0."""
         try:
-            txt = le.text().strip()
-            return float(txt) if txt else 0.0
+            txt = self._coefficient_text(le).strip()
+            return float(txt.replace(",", ".")) if txt else 0.0
         except Exception:
             return 0.0
 
@@ -4666,44 +4177,12 @@ class MyDialog(QtWidgets.QDialog):
         return ctrl.TransferFunction(num, den)
 
     def _setup_analysis_plots(self):
-        """
-        Replace your placeholder QWidgets:
-        - self.rlocus
-        - self.bode_plot
-        - self.time_response
-        with Matplotlib canvases.
-        """
-        # ---------- Root locus canvas ----------
-        fig_rl = Figure(figsize=(4, 3), tight_layout=True)
-        self.canvas_rl = FigureCanvas(fig_rl)
-        self.ax_rl = fig_rl.add_subplot(111)
-
-        # ---------- Bode canvas (2 axes: mag + phase) ----------
-        fig_bode = Figure(figsize=(4, 3), tight_layout=True)
-        self.canvas_bode = FigureCanvas(fig_bode)
-        self.ax_mag = fig_bode.add_subplot(211)
-        self.ax_phase = fig_bode.add_subplot(212)
-
-        # ---------- Time response canvas ----------
-        fig_step = Figure(figsize=(4, 3), tight_layout=True)
-        self.canvas_step = FigureCanvas(fig_step)
-        self.ax_step = fig_step.add_subplot(111)
-
-        # Helper to replace a placeholder widget that sits inside a layout
-        def _replace_in_parent_layout(placeholder_widget, new_widget):
-            parent = placeholder_widget.parentWidget()
-            if parent is None or parent.layout() is None:
-                raise RuntimeError(
-                    f"Placeholder '{placeholder_widget.objectName()}' has no parent layout. "
-                    "In Designer, put it inside a layout (e.g., QVBoxLayout)."
-                )
-            parent.layout().replaceWidget(placeholder_widget, new_widget)
-            placeholder_widget.setParent(None)
-            placeholder_widget.deleteLater()
-
-        _replace_in_parent_layout(self.rlocus, self.canvas_rl)
-        _replace_in_parent_layout(self.bode_plot, self.canvas_bode)
-        _replace_in_parent_layout(self.time_response, self.canvas_step)
+        """Configure the Matplotlib canvases declared in the Designer form."""
+        for canvas in (self.canvas_rl, self.canvas_step):
+            canvas.figure.set_size_inches(4, 3)
+            canvas.figure.set_layout_engine("tight")
+        self.ax_rl = self.canvas_rl.figure.add_subplot(111)
+        self.ax_step = self.canvas_step.figure.add_subplot(111)
 
         # Debounce plot updates (so it doesn't redraw on every keystroke instantly)
         self._analysis_timer = QTimer(self)
@@ -4742,16 +4221,13 @@ class MyDialog(QtWidgets.QDialog):
 
             if all(abs(x) < 1e-12 for x in num_test) or all(abs(x) < 1e-12 for x in den_test):
                 self.ax_rl.clear()
-                self.ax_mag.clear()
-                self.ax_phase.clear()
                 self.ax_step.clear()
 
-                for ax in (self.ax_rl, self.ax_mag, self.ax_phase, self.ax_step):
+                for ax in (self.ax_rl, self.ax_step):
                     ax.grid(True)
                     self._strip_titles_labels(ax, keep_x=False, keep_y=False)
 
                 self.canvas_rl.draw_idle()
-                self.canvas_bode.draw_idle()
                 self.canvas_step.draw_idle()
 
                 if hasattr(self, "plot_error"):
@@ -4762,8 +4238,6 @@ class MyDialog(QtWidgets.QDialog):
 
             # Clear all axes once
             self.ax_rl.clear()
-            self.ax_mag.clear()
-            self.ax_phase.clear()
             self.ax_step.clear()
 
             # Root locus
@@ -4779,34 +4253,18 @@ class MyDialog(QtWidgets.QDialog):
 
             self._overlay_sgrid(self.ax_rl, show_labels=False)
 
-            # Bode
-            omega = np.logspace(-2, 3, 600)
-            ctrl.bode_plot(
-                sys,
-                omega=omega,
-                ax=[self.ax_mag, self.ax_phase],
-                dB=True,
-                deg=True,
-                Hz=False,
-                grid=True,
-            )
-            self.ax_mag.tick_params(axis="x", which="both", labelbottom=False)
-
             # Step response
             t = np.linspace(0, 5, 800)
             t, y = ctrl.step_response(sys, T=t)
-            self.ax_step.plot(t, y)
+            self._plot_time_mpl(self.ax_step, t, y)
             self.ax_step.grid(True)
 
             # Remove titles/labels
             self._strip_titles_labels(self.ax_rl, keep_x=False, keep_y=False)
-            self._strip_titles_labels(self.ax_mag, keep_x=False, keep_y=False)
-            self._strip_titles_labels(self.ax_phase, keep_x=False, keep_y=False)
             self._strip_titles_labels(self.ax_step, keep_x=False, keep_y=False)
 
             # Draw once
             self.canvas_rl.draw_idle()
-            self.canvas_bode.draw_idle()
             self.canvas_step.draw_idle()
 
             if hasattr(self, "plot_error"):
@@ -4826,20 +4284,42 @@ class MyDialog(QtWidgets.QDialog):
     def tabChanged(self):
         self.toggleupdate_parameters()
 
+    def _firmware_tab_id(self):
+        # Protocol IDs predate Designer page reordering; keep them stable.
+        page = self.tabWidget.currentWidget()
+        return {
+            "tab": 0, "tab_4": 1, "tab_5": 2, "tab_6": 3,
+            "tab_7": 4, "tab_3": 5, "tab_2": 6, "tab_8": 7,
+            "Digital": 8, "tab_9": 9, "tab_10": 10, "tab_11": 11,
+            "Continuous": 8,
+        }.get(page.objectName() if page is not None else "", 0)
+
     def toggleupdate_parameters(self, update_runtime_config=False):
         if update_runtime_config:
             self._runtime_config_values = self._read_runtime_config_values_from_ui()
 
         # Collect the current values from UI elements or class variables
-        StartStop = '0' if self.StartStop.text() == "Start" else '1'
-        A = self._numeric_text(self.A)
-        B = self._numeric_text(self.B)
-        C = self._numeric_text(self.C)
-        D = self._numeric_text(self.D)
-        E = self._numeric_text(self.E)
-        F = self._numeric_text(self.F)
-        G = self._numeric_text(self.G)
-        H = self._numeric_text(self.H)
+        StartStop = '1' if self.isRunning else '0'
+        coefficient_error = None
+        continuous_active = self.tabWidget.currentWidget() is self.Continuous
+        try:
+            if continuous_active:
+                numerator, feedback = self._prepare_continuous_controller(self._read_continuous_controller())
+                coefficients = [*numerator[:4], *feedback, numerator[4]]
+            else:
+                coefficients = [float((getattr(self, name).text() or "0").replace(",", ".")) for name in "ABCDEFGHI"]
+            with np.errstate(over="ignore", under="ignore"):
+                deployed = np.asarray(coefficients, dtype=np.float32)
+            if not np.all(np.isfinite(deployed)) or np.any((np.asarray(coefficients) != 0) & (deployed == 0)):
+                raise ValueError("Coefficients must be finite and within firmware float32 range.")
+        except (ValueError, TypeError, OverflowError) as exc:
+            if StartStop != '0':
+                self.textBrowser.setText(f"Controller was not sent: {exc}")
+                return False
+            # A Stop command must remain usable while invalid fields are being edited.
+            deployed = np.zeros(9)
+            coefficient_error = str(exc)
+        A, B, C, D, E, F, G, H, I = (f"{value:.9g}" for value in deployed)
         delay = self._numeric_text(self.delay, minimum=1, integer=True)
         # Send the data
         tiporef = int(self.automaticinput.isChecked())
@@ -4850,7 +4330,7 @@ class MyDialog(QtWidgets.QDialog):
         amplitud = self._numeric_text(self.amplitude, integer=True)
         referenciaManual = self._numeric_text(self.reference, integer=True)
         offset = self._numeric_text(self.offset, integer=True)
-        activetab = self.tabWidget.currentIndex()
+        activetab = self._firmware_tab_id()
         Kp = self._numeric_text(self.Kp)
         Ki = self._numeric_text(self.Ki)
         Kd = self._numeric_text(self.Kd)
@@ -4863,7 +4343,8 @@ class MyDialog(QtWidgets.QDialog):
         PWM_min = runtime_config["PWM_min"]
         PWM_max = runtime_config["PWM_max"]
         RPM_filter = runtime_config["RPM_filter"]
-        self.SendData(StartStop, selected_mode, A, B, C, D, E, F, G, H, delay, tiemporeferencia, amplitud, referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time,PPR,PWM_min,PWM_max,RPM_filter)
+        if not self.SendData(StartStop, selected_mode, A, B, C, D, E, F, G, H, delay, tiemporeferencia, amplitud, referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time,PPR,PWM_min,PWM_max,RPM_filter,I):
+            return False
         if self.gui_only:
             self.textBrowser.setText("GUI only — no hardware connected, commands are not sent")
         elif not self.controller_connected:
@@ -4881,15 +4362,18 @@ class MyDialog(QtWidgets.QDialog):
         if selected_mode == "3":
             pi = self.graphWidgetRPM.getPlotItem()
             pi.setLabel('left', 'Motor Position', units='degrees')
+        if coefficient_error:
+            self.textBrowser.append(f"Invalid coefficients; correct before Start: {coefficient_error}")
+        return True
 
     def plot_simulation(self, t, y):
-        self.graphWidgetRPM.plot(t, y, pen='y', name="Simulated (Threaded)")
+        self._plot_time_pg(self.graphWidgetRPM, t, y, pen='y', name="Simulated (Threaded)")
 
     def toggleStartStop(self):
         if self.isRunning:
             self._test_duration_timer.stop()
             self.isRunning = False
-            self.StartStop.setText("Start")
+            self.StartStop.setText("START")
             self.StopAction()
         else:
             duration_ms = None
@@ -4898,8 +4382,12 @@ class MyDialog(QtWidgets.QDialog):
                 if duration_ms is None:
                     return
             self.isRunning = True
-            self.StartStop.setText("Stop")
-            self.StartAction()
+            self.StartStop.setText("STOP")
+            if not self.StartAction():
+                self.isRunning = False
+                self.StartStop.setText("START")
+                self._set_runtime_plot_interaction(enabled=True)
+                return
             if duration_ms is not None:
                 self._test_duration_timer.start(duration_ms)
 
@@ -4989,17 +4477,30 @@ class MyDialog(QtWidgets.QDialog):
                 unique.append(guess)
         return unique
 
-    def _simulate_identified_model(self, theta, numorder, denorder, time, u):
+    def _simulate_identified_model(self, theta, numorder, denorder, time, u, measured=None):
         theta = np.asarray(theta, dtype=float).ravel()
         num = theta[:numorder + 1]
         den = np.r_[1.0, theta[numorder + 1:]]
         sys_tf = ctrl.TransferFunction(num, den)
-        _, yout = ctrl.forced_response(sys_tf, T=time, U=u)
+        yout = simulate_zoh_transfer(num, den, time, u, measured=measured)
         return sys_tf, np.asarray(yout, dtype=float).ravel()
 
     def _fit_transfer_function(self, numorder, denorder, time, u, y):
         if numorder > denorder:
             raise ValueError("Numerator order must be less than or equal to denominator order.")
+
+        time, u, y = (np.asarray(values, dtype=float).ravel() for values in (time, u, y))
+        if len(time) != len(u) or len(time) != len(y):
+            raise ValueError("Identification time, input and output must have matching lengths.")
+        if not all(np.all(np.isfinite(values)) for values in (time, u, y)):
+            raise ValueError("Identification time, input and output must be finite.")
+        if len(time) <= numorder + 1 + 2 * denorder:
+            raise ValueError("Insufficient samples for the requested model order and initial conditions.")
+        if len(time) < 2 or np.any(np.diff(time) <= 0):
+            raise ValueError("Identification requires increasing sample times.")
+        Ts = time[1] - time[0]
+        if not np.allclose(np.diff(time), Ts, rtol=1e-7, atol=Ts * 1e-9):
+            raise ValueError("Resample identification data to uniform sample times before fitting.")
 
         y_scale = max(float(np.std(y)), 1.0)
         stability_margin = 1e-6
@@ -5012,7 +4513,7 @@ class MyDialog(QtWidgets.QDialog):
 
         def residual(theta):
             try:
-                sys_tf, yout = self._simulate_identified_model(theta, numorder, denorder, time, u)
+                sys_tf, yout = self._simulate_identified_model(theta, numorder, denorder, time, u, measured=y)
                 if len(yout) != len(y) or not np.all(np.isfinite(yout)):
                     return np.full(len(y) + denorder, 1e6, dtype=float)
 
@@ -5036,12 +4537,11 @@ class MyDialog(QtWidgets.QDialog):
                     residual,
                     x0,
                     bounds=(lower, upper),
-                    loss="soft_l1",
-                    f_scale=0.5,
+                    loss="linear",
                     x_scale="jac",
                     max_nfev=3000,
                 )
-                sys_tf, yfit = self._simulate_identified_model(result.x, numorder, denorder, time, u)
+                sys_tf, yfit = self._simulate_identified_model(result.x, numorder, denorder, time, u, measured=y)
                 if not np.all(np.isfinite(yfit)):
                     continue
 
@@ -5094,8 +4594,8 @@ class MyDialog(QtWidgets.QDialog):
             if n > 1:
                 time[1:] = np.cumsum(dt[:-1])
 
-            # ---- 3) Make time uniform (lsim/forced_response requirement) ----
-            # Use median Ts and interpolate u,y to that grid
+            # ---- 3) Make time uniform for ZOH simulation ----
+            # Hold PWM between samples; only the measured output is interpolated.
             if n > 2:
                 Ts = float(np.median(np.diff(time)))
             else:
@@ -5111,7 +4611,7 @@ class MyDialog(QtWidgets.QDialog):
                 # Interpolate to uniform grid covering the same duration
                 N = int(np.round(time[-1] / Ts)) + 1
                 time_uniform = np.arange(N, dtype=float) * Ts
-                u = np.interp(time_uniform, time, u)
+                u = resample_held_input(time, u, time_uniform)
                 y = np.interp(time_uniform, time, y)
                 time = time_uniform
 
@@ -5120,10 +4620,8 @@ class MyDialog(QtWidgets.QDialog):
                 numorder, denorder, time, u, y
             )
             self.identified_sys_tf = identified_system
-            stability_note = "" if stable_fit else "\n\nWarning: best fit is not strictly stable."
-            self.identificationresult.setText(
-                f"Identified Transfer Function:\n{identified_system}{stability_note}"
-            )
+            if not stable_fit:
+                self.textBrowser.setText("Warning: best fit is not strictly stable.")
 
             # ---- 5) Plot response vs measured ----
 
@@ -5133,8 +4631,8 @@ class MyDialog(QtWidgets.QDialog):
                 y_min, y_max = y_min - 1.0, y_max + 1.0
 
             self.graphWidgetforced_response.setYRange(y_min * 0.95, y_max * 1.05)
-            self.graphWidgetforced_response.plot(time, y_identified, pen='y', name="Identified Response")
-            self.graphWidgetforced_response.plot(time, y,           pen='r', name="Measured Response")
+            self._plot_time_pg(self.graphWidgetforced_response, time, y_identified, pen='y', name="Identified Response")
+            self._plot_time_pg(self.graphWidgetforced_response, time, y, pen='r', name="Measured Response")
 
             # --- Fit metrics ---
             residuals = y - y_identified
@@ -5149,6 +4647,11 @@ class MyDialog(QtWidgets.QDialog):
             self.mae.setText(f"{mae:.2f}")
             self.r2.setText(f"{r2:.2f}")
             self.nrmse.setText(f"{nrmse:.2f}")
+            fit_percent = 100.0 * (1.0 - nrmse) if yvar > 0 else float('nan')
+            self.identificationresult.setText(
+                f"{self.tf_to_pretty_str(identified_system)}\n\n"
+                f"Fit to estimation data: {fit_percent:.4f}%"
+            )
 
             # Append to the GUI text
             #txt = self.identificationresult.toPlainText()
@@ -5163,9 +4666,6 @@ class MyDialog(QtWidgets.QDialog):
 
     def update_graph(self):
         try:
-            if not self.isRunning:
-                return
-
             if self.serial_port is None or (hasattr(self.serial_port, "is_open") and not self.serial_port.is_open):
                 self._try_reconnect_serial()
                 return
@@ -5189,6 +4689,21 @@ class MyDialog(QtWidgets.QDialog):
                     self._show_controller_disconnected(e)
                     return
                 self.serial_in.setText(line)
+                if line == "#CAPS DC_MOTOR B4":
+                    self._supports_b4 = True
+                    if self.firmware_pwm_bits is None:
+                        self.firmware_pwm_bits = 8  # legacy firmware has no resolution reply
+                    continue
+                if line.startswith("#PWM_BITS "):
+                    try:
+                        bits = int(line.split()[1])
+                        if 1 <= bits <= 16:
+                            self.firmware_pwm_bits = bits
+                    except (ValueError, IndexError):
+                        pass
+                    continue
+                if not self.isRunning:
+                    continue
 
                 try:
                     vals = [float(x) for x in line.split()]
@@ -5233,15 +4748,17 @@ class MyDialog(QtWidgets.QDialog):
                         if has_current_avg:
                             f.write(
                                 f"{int(sp)},{int(meas)},{dt_ms:.3f},"
-                                f"{raw_current:.2f},{current_avg:.2f},{int(pwm)}{dmm_suffix}\n"
+                                f"{raw_current:.2f},{current_avg:.2f},{pwm:.9g}{dmm_suffix}\n"
                             )
                         else:
                             f.write(
                                 f"{int(sp)},{int(meas)},{dt_ms:.3f},"
-                                f"{raw_current:.2f},{int(pwm)}{dmm_suffix}\n"
+                                f"{raw_current:.2f},{pwm:.9g}{dmm_suffix}\n"
                             )
 
             # ----- Plot latest window (equal-length slices) -----
+            if not self.isRunning:
+                return
             N = min(len(self.dataDT), len(self.dataRPM_setpoint), len(self.dataRPM_measured), len(self.dataPWM))
             if N == 0:
                 return
@@ -5259,9 +4776,9 @@ class MyDialog(QtWidgets.QDialog):
             y_mea = np.asarray(self.dataRPM_measured, dtype=float)[-N:]
             y_pwm = np.asarray(self.dataPWM, dtype=float)[-N:]
 
-            self.curve_setpoint.setData(t, y_sp)
-            self.curve_measured.setData(t, y_mea)
-            self.curve_pwm.setData(t, y_pwm)
+            self.curve_setpoint.setData(t, y_sp, stepMode=self._pg_step_mode())
+            self.curve_measured.setData(t, y_mea, stepMode=self._pg_step_mode())
+            self.curve_pwm.setData(t, y_pwm, stepMode=self._pg_step_mode())
 
             if "Position" in self.modooperacion.currentText():
                 ymin = float(min(y_sp.min(initial=0), y_mea.min(initial=0)))
@@ -5291,7 +4808,7 @@ class MyDialog(QtWidgets.QDialog):
         self._reset_recording_state()
         self._reset_runtime_plots()
         self._set_runtime_plot_interaction(enabled=False)
-        self.toggleupdate_parameters()
+        return self.toggleupdate_parameters()
 
     def StopAction(self):
         print("Paro de control de motor")
@@ -5302,7 +4819,7 @@ class MyDialog(QtWidgets.QDialog):
         try:
             self._test_duration_timer.stop()
             self._stop_dmm_worker(wait=True)
-            self.StartStop.setText("Start")
+            self.StartStop.setText("START")
             self.isRunning = False
             if self.serial_port is not None and (not hasattr(self.serial_port, "is_open") or self.serial_port.is_open):
                 self.toggleupdate_parameters()
@@ -5311,18 +4828,35 @@ class MyDialog(QtWidgets.QDialog):
             print(f"closeEvent serial cleanup error: {e}")
         super().closeEvent(event)
 
-    def SendData(self, StartStop, selected_mode, A, B, C, D, E, F, G, H,delay,tiemporeferencia,amplitud,referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time,PPR,PWM_min,PWM_max,RPM_filter):
+    def SendData(self, StartStop, selected_mode, A, B, C, D, E, F, G, H,delay,tiemporeferencia,amplitud,referenciaManual,offset,tiposenal,activetab,Kp,Ki,Kd,deadzone,time_constant,PIDtype,tiporef,reset_time,PPR,PWM_min,PWM_max,RPM_filter,I="0"):
         data_string=f"{StartStop},{selected_mode},{A},{B},{C},{D},{E},{F},{G},{H},{delay},{tiemporeferencia},{amplitud},{referenciaManual},{offset},{tiposenal},{activetab},{Kp},{Ki},{Kd},{deadzone},{time_constant},{PIDtype},{tiporef},{reset_time},{PPR},{PWM_min},{PWM_max},{RPM_filter}"
+        try:
+            b4 = float(str(I).replace(",", "."))
+            values = np.array([A, B, C, D, E, F, G, H, b4], dtype=float)
+            with np.errstate(over="ignore", under="ignore"):
+                firmware_values = values.astype(np.float32)
+            if not np.all(np.isfinite(firmware_values)) or np.any((values != 0) & (firmware_values == 0)):
+                raise ValueError("Coefficients exceed firmware float32 range.")
+            if b4 != 0:
+                if not self.gui_only and not self._supports_b4 and str(StartStop) != "0":
+                    raise ValueError("Firmware has not confirmed B4 support. Update/connect the firmware before sending I != 0.")
+                if self.gui_only or self._supports_b4:
+                    data_string += f",{b4:.9g}"
+        except (ValueError, TypeError) as exc:
+            self.textBrowser.setText(f"Controller was not sent: {exc}")
+            return False
         data_bytes = (data_string + '\n').encode('utf-8')
         self.serial_out.setText(data_string)
         if self.serial_port is None or (hasattr(self.serial_port, "is_open") and not self.serial_port.is_open):
             self._try_reconnect_serial()
-            return
+            return True
 
         try:
             self.serial_port.write(data_bytes)
+            return True
         except (serial.SerialTimeoutException, serial.SerialException, OSError) as e:
             self._show_controller_disconnected(e)
+            return False
 
     def update_slider_from_line_edit(self):
         try:
@@ -5365,10 +4899,6 @@ def main():
 
         dlg = MyDialog(port=port, gui_only=gui_only)
         if gui_only or dlg.serial_port is not None:   # opened OK in the constructor
-            if gui_only:
-                dlg.setWindowTitle("Motor DC Control — GUI only - By A Von Chong")
-            else:
-                dlg.setWindowTitle(f"Motor DC Control — {port} - By A Von Chong")
             dlg.show()
             sys.exit(app.exec())
 

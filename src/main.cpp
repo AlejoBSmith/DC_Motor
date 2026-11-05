@@ -2,10 +2,16 @@
 #include "MovingAvgF.h"
 #include "MovingMedianF.h"
 #include <math.h>
+#include "DifferenceController.h"
 
 // ====================================
-//#define USE_ARDUINO
-#define USE_TEENSY
+#if defined(ARDUINO_TEENSY40)
+  #define USE_TEENSY
+#elif defined(ARDUINO_UNOR4_WIFI)
+  #define USE_ARDUINO
+#else
+  #error "Tarjeta no soportada"
+#endif
 // ====================================
 
 struct MotorPins {
@@ -27,8 +33,7 @@ struct MotorPins {
 };
 
 struct ControlParams {
-  float x[5] = {0, 0, 0, 0, 0};
-  float y[5] = {0, 0, 0, 0, 0};
+  DifferenceController digital;
   float error = 0;
   float integral_sum = 0;     // para PID posicional
   float dFiltered = 0;        // para derivada filtrada
@@ -37,15 +42,8 @@ struct ControlParams {
   float controladorOUT = 0;
   int PPR = 240; // Pulsos por revolución encoder
   int PWMOUT = 0;
+  float pwmApplied = 0.0f; // actual PWM in normalized 0..255 units for telemetry
   int ZM = 10; // ZM es la zona muerta del motor, se identifica con System Ident, con onda triangular
-  float A_cont = 0;
-  float B_cont = 0;
-  float C_cont = 0;
-  float D_cont = 0;
-  float E_cont = 0;
-  float F_cont = 0;
-  float G_cont = 0;
-  float H_cont = 0;
   float Kp = 0;
   float Ki = 0;
   float Kd = 0;
@@ -113,8 +111,39 @@ EncoderData enc;
 SerialData serialData;
 MeasurementsData meas;
 
+void setMotorDirection(float output) {
+  #ifdef USE_ARDUINO
+    digitalWrite(pins.in1Pin, output >= 0 ? HIGH : LOW);
+    digitalWrite(pins.in2Pin, output >= 0 ? LOW : HIGH);
+  #endif
+  #ifdef USE_TEENSY
+    digitalWrite(pins.in1Pin, output >= 0 ? LOW : HIGH);
+  #endif
+}
+
+#ifdef USE_TEENSY
+int PWMbits = 12; // configurable hardware resolution; controller units remain 0..255
+#else
+int PWMbits = 8;  // preserve the UNO R4 default
+#endif
+
+void configureMotorPwm() {
+  #ifdef USE_TEENSY
+    PWMbits = constrain(PWMbits, 1, 16);
+  #else
+    PWMbits = constrain(PWMbits, 1, 12);
+  #endif
+  analogWriteResolution(PWMbits);
+}
+
+void applyMotorPwm(int counts) {
+  ctrl.PWMOUT = constrain(counts, 0, pwmFullScale(PWMbits));
+  ctrl.pwmApplied = pwmToNormalized(ctrl.PWMOUT, PWMbits);
+  analogWrite(pins.pwmPin, ctrl.PWMOUT);
+}
 constexpr int LEGACY_COMMAND_FIELD_COUNT = 25;
-constexpr int COMMAND_FIELD_COUNT = 29;
+constexpr int RUNTIME_COMMAND_FIELD_COUNT = 29;
+constexpr int COMMAND_FIELD_COUNT = 30; // optional b4 (I) appended to the 29-field format
 int avgwindowsize = 1;
 int currentwindowsize = 4; //la medición de corriente es particularmente ruidosa
 MovingAvgF RPMAvg(avgwindowsize);
@@ -132,6 +161,7 @@ int divideString(String DatoSerial, char delimitador, String salida[], int limit
     DatoSerial = DatoSerial.substring(posicion + 1);
   }
   if (indice < limite) {
+    if (DatoSerial.indexOf(delimitador) != -1) return -1; // never accept truncated commands
     salida[indice] = DatoSerial;
     salida[indice].trim();
     indice++;
@@ -140,10 +170,7 @@ int divideString(String DatoSerial, char delimitador, String salida[], int limit
 }
 
 void resetControllerMemory() {
-  for (int i = 0; i < 5; i++) {
-    ctrl.x[i] = 0.0f;
-    ctrl.y[i] = 0.0f;
-  }
+  ctrl.digital.reset();
 
   ctrl.error = 0.0f;
   ctrl.integral_sum = 0.0f;
@@ -152,6 +179,7 @@ void resetControllerMemory() {
   ctrl.previousOutput = 0.0f;
   ctrl.controladorOUT = 0.0f;
   ctrl.PWMOUT = 0;
+  ctrl.pwmApplied = 0.0f;
   ctrl.d_y = 0.0f;
   ctrl.d_out_prev = 0.0f;
 }
@@ -330,7 +358,7 @@ inline void PID_update_coeficientes(float Ts) {
   }
 }
 
-int PID_positional_Tustin() {
+float PID_positional_Tustin() {
   float Ts = timing.tiempociclo / 1000.0f;
   PID_update_coeficientes(Ts);
   const float lo = (sys.modooperacion == 3) ? -255.0f : 0.0f;
@@ -365,10 +393,10 @@ int PID_positional_Tustin() {
   ctrl.controladorOUT = u_sat;
   ctrl.previousError  = e;
 
-  return (int)lroundf(u_sat);
+  return u_sat;
 }
 
-int PID_incremental() {
+float PID_incremental() {
   float Ts = timing.tiempociclo / 1000.0f;
   PID_update_coeficientes(Ts);
 
@@ -397,29 +425,17 @@ int PID_incremental() {
   ctrl.controladorOUT = u_sat;
   ctrl.previousOutput = u_sat;
   ctrl.previousError  = ctrl.error;
-  return (int)lroundf(u_sat);
+  return u_sat;
 }
 
-int EcuacionDiferencias() { //Aquí, X es la entrada (error) y Y es la salida (PWM Arduino)
-  ctrl.x[3] = ctrl.x[2];
-  ctrl.x[2] = ctrl.x[1];
-  ctrl.x[1] = ctrl.x[0];
-  ctrl.x[0] = ctrl.error;
-  ctrl.y[4] = ctrl.y[3];
-  ctrl.y[3] = ctrl.y[2];
-  ctrl.y[2] = ctrl.y[1];
-  ctrl.y[1] = ctrl.controladorOUT;
-
-  ctrl.controladorOUT = ctrl.A_cont * ctrl.x[0] + ctrl.B_cont * ctrl.x[1] + ctrl.C_cont * ctrl.x[2] + ctrl.D_cont * ctrl.x[3] +
-                         ctrl.E_cont * ctrl.y[1] + ctrl.F_cont * ctrl.y[2] + ctrl.G_cont * ctrl.y[3] + ctrl.H_cont * ctrl.y[4];
-  if (sys.modooperacion == 2)
-    ctrl.controladorOUT = constrain(ctrl.controladorOUT, 0, 255);
-  if (sys.modooperacion == 3)
-    ctrl.controladorOUT = constrain(ctrl.controladorOUT, -255, 255);
-  return (int)lroundf(ctrl.controladorOUT);
+float EcuacionDiferencias() {
+  const float lo = (sys.modooperacion == 3) ? -255.0f : 0.0f;
+  ctrl.controladorOUT = ctrl.digital.step(ctrl.error, lo, 255.0f);
+  return ctrl.controladorOUT;
 }
 
 void setup() {
+  configureMotorPwm();
   Serial.setTimeout(5);
   pinMode(pins.pwmPin, OUTPUT);
   pinMode(pins.in1Pin, OUTPUT);
@@ -443,19 +459,21 @@ void loop() {
     serialData.DatoSerial = Serial.readStringUntil('\n');
     serialData.DatoSerial.trim();
 
+    if (serialData.DatoSerial == "CAPS?") {
+      Serial.println("#CAPS DC_MOTOR B4");
+      Serial.print("#PWM_BITS ");
+      Serial.println(PWMbits);
+    } else {
     String parts[COMMAND_FIELD_COUNT];
     int fieldCount = divideString(serialData.DatoSerial, ',', parts, COMMAND_FIELD_COUNT);
-    if (fieldCount == LEGACY_COMMAND_FIELD_COUNT || fieldCount == COMMAND_FIELD_COUNT) {
+    if (fieldCount == LEGACY_COMMAND_FIELD_COUNT || fieldCount == RUNTIME_COMMAND_FIELD_COUNT || fieldCount == COMMAND_FIELD_COUNT) {
       sys.inicio              = parts[0].toInt();
       sys.modooperacion       = parts[1].toInt();
-      ctrl.A_cont             = parts[2].toFloat();
-      ctrl.B_cont             = parts[3].toFloat();
-      ctrl.C_cont             = parts[4].toFloat();
-      ctrl.D_cont             = parts[5].toFloat();
-      ctrl.E_cont             = parts[6].toFloat();
-      ctrl.F_cont             = parts[7].toFloat();
-      ctrl.G_cont             = parts[8].toFloat();
-      ctrl.H_cont             = parts[9].toFloat();
+      for (int i = 0; i < 4; ++i) {
+        ctrl.digital.b[i] = parts[2 + i].toFloat();
+        ctrl.digital.feedback[i] = parts[6 + i].toFloat();
+      }
+      ctrl.digital.b[4] = (fieldCount == COMMAND_FIELD_COUNT) ? parts[29].toFloat() : 0.0f;
       timing.delayintencional = parts[10].toInt();
 
       long referencePeriod = parts[11].toInt();
@@ -474,7 +492,7 @@ void loop() {
       ctrl.PIDtype            = parts[22].toInt();
       sys.tiporef             = parts[23].toInt();
       ctrl.reset_time         = parts[24].toFloat();
-      if (fieldCount == COMMAND_FIELD_COUNT) {
+      if (fieldCount >= RUNTIME_COMMAND_FIELD_COUNT) {
         ctrl.PPR              = parts[25].toInt();
         int pwmMin            = parts[26].toInt();
         int pwmMax            = parts[27].toInt();
@@ -493,6 +511,7 @@ void loop() {
 
       inicializaVariables();
     }
+    }
   }
 
   const uint32_t now_us = micros();
@@ -506,24 +525,25 @@ void loop() {
       switch (sys.modooperacion) {
         case 0: // Inhabilitado
           resetControllerMemory();
-          analogWrite(pins.pwmPin, 0);
+          applyMotorPwm(0);
           delay(50);
           break;
 
         case 1: { // System Identification
+          setMotorDirection(0);
           sys.referencia      = ActualizarReferencia();
           ctrl.controladorOUT = sys.referencia;
           if (timing.tiempociclo < 1) timing.tiempociclo = timing.delayintencional;
           meas.RPM         = consumeEncoderTicks() / (float)timing.tiempociclo * 60.0f * 1000.0f / (4.0f * ctrl.PPR);
           meas.RPMPromedio = RPMAvg.reading(meas.RPM);
-          ctrl.PWMOUT = constrain(ctrl.controladorOUT,0,255);
-          ctrl.controladorOUT = ctrl.PWMOUT;
-          analogWrite(pins.pwmPin, ctrl.PWMOUT);
+          ctrl.controladorOUT = constrain(ctrl.controladorOUT, 0.0f, 255.0f);
+          applyMotorPwm(pwmFromNormalized(ctrl.controladorOUT, PWMbits));
           sys.medicion = meas.RPMPromedio;
           break;
         }
 
         case 2: { // Control Velocidad
+          setMotorDirection(0);
           sys.referencia = ActualizarReferencia();
           if (timing.tiempociclo < 1) timing.tiempociclo = timing.delayintencional;
           meas.RPM         = consumeEncoderTicks() / (float)timing.tiempociclo * 60.0f * 1000.0f / (4.0f * ctrl.PPR);
@@ -538,8 +558,7 @@ void loop() {
               default: ctrl.controladorOUT = 0; break;
             }
             if (sys.referencia != 0){
-              ctrl.PWMOUT = ctrl.controladorOUT + ctrl.ZM; // zona muerta solo si ref ≠ 0
-              ctrl.PWMOUT = constrain(ctrl.PWMOUT,0,255);
+              ctrl.PWMOUT = speedPwm(ctrl.controladorOUT, ctrl.ZM, PWMbits);
             } else {
               resetControllerMemory();
             }
@@ -547,15 +566,14 @@ void loop() {
           else if (sys.tab_activo == 8){
             ctrl.controladorOUT = EcuacionDiferencias();
             if (sys.referencia != 0){
-              ctrl.PWMOUT = ctrl.controladorOUT + ctrl.ZM;
-              ctrl.PWMOUT = constrain(ctrl.PWMOUT,0,255);
+              ctrl.PWMOUT = speedPwm(ctrl.controladorOUT, ctrl.ZM, PWMbits);
             } else {
               resetControllerMemory();
             }
           } else {
             resetControllerMemory();
           }
-          analogWrite(pins.pwmPin, ctrl.PWMOUT);
+          applyMotorPwm(ctrl.PWMOUT);
           sys.medicion = meas.RPMPromedio;
           break;
         }
@@ -578,27 +596,10 @@ void loop() {
           }
           u = constrain(u, -255, 255);
 
-          #ifdef USE_ARDUINO
-            if (u >= 0) {
-              digitalWrite(pins.in1Pin, HIGH);
-              digitalWrite(pins.in2Pin, LOW);
-            } else {
-              digitalWrite(pins.in1Pin, LOW);
-              digitalWrite(pins.in2Pin, HIGH);
-            }
-          #endif
-
-          #ifdef USE_TEENSY
-            if (u >= 0) {
-              digitalWrite(pins.in1Pin, LOW);   // DIR = forward
-            } else {
-              digitalWrite(pins.in1Pin, HIGH);  // DIR = reverse
-            }
-          #endif
+          setMotorDirection(u);
 
           ctrl.controladorOUT = u;
-          ctrl.PWMOUT         = constrain(fabsf(u),0,255); // el PWM debe ser igual de 0 a 255, aunque U puede ser negativo o positivo, para que el motor pueda girar hacia atrás
-          analogWrite(pins.pwmPin, ctrl.PWMOUT);
+          applyMotorPwm(positionPwm(u, PWMbits)); // magnitude only; direction is set above
           sys.medicion = (int)sys.deg;
           break;
         }
@@ -611,13 +612,13 @@ void loop() {
         meas.currentMedian = FilteredCurrentMedian.reading(meas.current);
         meas.currentAvgAux = FilteredCurrent.reading(meas.currentMedian);
         meas.currentAvg = FilteredCurrent2.reading(meas.currentAvgAux);
-        Serial.printf("%d %d %.3f %.2f %.2f %d\n",
+        Serial.printf("%d %d %.3f %.2f %.2f %.9g\n",
                       (int)sys.referencia,
                       (int)sys.medicion,
                       (double)timing.tiempociclo,
                       (float)meas.rawcurrent,
                       (float)meas.currentAvg,   // no usado aún en la GUI
-                      (int)ctrl.PWMOUT);
+                      (double)ctrl.pwmApplied);
       #endif
 
       #ifdef USE_ARDUINO
@@ -630,12 +631,12 @@ void loop() {
         Serial.print(" ");
         Serial.print((int)meas.current);
         Serial.print(" ");
-        Serial.println(ctrl.PWMOUT);
+        Serial.println(ctrl.pwmApplied, 9);
       #endif
     } 
     else {
       resetControllerMemory();
-      analogWrite(pins.pwmPin, 0);
+      applyMotorPwm(0);
       delay(10);
     }
     timing.tiempociclo_us = 0;
