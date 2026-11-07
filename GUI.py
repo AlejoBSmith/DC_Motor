@@ -11,7 +11,7 @@ import control as ctrl
 from datetime import datetime
 from collections import deque
 from time import monotonic, sleep
-from PyQt6 import QtCore, QtWidgets, uic
+from PyQt6 import QtCore, QtGui, QtWidgets, uic
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QButtonGroup, QDialog, QMessageBox
 from scipy.optimize import least_squares, minimize_scalar
@@ -32,6 +32,35 @@ KNOWN_VIDPID = {
 }
 PREF_DESCR = ("Teensy", "UNO R4")  # optional: bias by description text
 LINE_EDIT_CONFIG_FILENAME = ".gui_config.json"
+
+
+def centered_moving_average(time_s, values, window_s=0.03):
+    """Display-only centered mean, with symmetric shorter windows at the edges.
+
+    The nominal window is 30 ms (at least three samples). Symmetric sample
+    weights avoid a time shift; the newest edge is revised as samples arrive.
+    """
+    time_s = np.asarray(time_s, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if time_s.ndim != 1 or values.ndim != 1 or len(time_s) != len(values):
+        raise ValueError("Time and signal must be equally sized one-dimensional arrays.")
+    if len(values) < 3:
+        return values.copy()
+    intervals = np.diff(time_s)
+    intervals = intervals[np.isfinite(intervals) & (intervals > 0)]
+    if not len(intervals):
+        return values.copy()
+    half_window = max(1, int(round(window_s / (2 * np.median(intervals)))))
+    index = np.arange(len(values))
+    radius = np.minimum(half_window, np.minimum(index, len(values) - 1 - index))
+    left, right = index - radius, index + radius + 1
+    finite = np.isfinite(values)
+    total = np.r_[0.0, np.cumsum(np.where(finite, values, 0.0))]
+    count = np.r_[0, np.cumsum(finite)]
+    counts = count[right] - count[left]
+    result = np.full(len(values), np.nan)
+    np.divide(total[right] - total[left], counts, out=result, where=counts > 0)
+    return result
 
 
 def _load_designer_form(window, filename):
@@ -2138,6 +2167,7 @@ class MyDialog(QtWidgets.QDialog):
         self.dataRPM_measured = deque(maxlen=datapoints)
         self.dataPWM = deque(maxlen=datapoints)
         self.dataDT = deque(maxlen=datapoints)   # ms per sample
+        self.dataCurrent = deque(maxlen=datapoints)  # calibrated, filtered mA; NaN if unavailable
         self.tabWidget.currentChanged.connect(self.tabChanged)
 
         self.reference.textChanged.connect(self.update_slider_from_line_edit)
@@ -2247,6 +2277,7 @@ class MyDialog(QtWidgets.QDialog):
         self.curve_setpoint = self._plot_time_pg(self.graphWidgetRPM, name="Input", pen=pg.mkPen(color='b', width=3, style=QtCore.Qt.PenStyle.SolidLine))  # Blue line for setpoint
         self.curve_measured = self._plot_time_pg(self.graphWidgetRPM, name="Output", pen=pg.mkPen(color='r', width=3, style=QtCore.Qt.PenStyle.SolidLine))  # Red line for measured
         self.curve_pwm = self._plot_time_pg(self.graphWidgetPWM, name="PWM", pen=pg.mkPen(color='g', width=3, style=QtCore.Qt.PenStyle.SolidLine))       # Green line for PWM
+        self._setup_telemetry_overlays()
         self.modo_plot.currentTextChanged.connect(self._on_plot_mode_changed)
         self._set_runtime_plot_interaction(enabled=True)
 
@@ -2815,6 +2846,108 @@ class MyDialog(QtWidgets.QDialog):
             line.set_gid("time-series")
         return lines
 
+    def _setup_telemetry_overlays(self):
+        self.curve_rpm_average = self._plot_time_pg(
+            self.graphWidgetRPM, pen=pg.mkPen('y', width=3), connect="finite")
+        self.curve_rpm_average.setZValue(1)
+        self.curve_measured.setZValue(2)
+        self.curve_rpm_average.hide()
+        self._rpm_average_is_visible = False
+
+        # Keep the two time axes aligned even when their Y tick labels have
+        # different lengths. The reservation scales with the existing UI font.
+        tick_font = self.graphWidgetRPM.getPlotItem().getAxis('left').style['tickFont'] or QtWidgets.QApplication.font()
+        tick_width = int(np.ceil(QtGui.QFontMetricsF(tick_font).horizontalAdvance('-99999')))
+        for plot in self._runtime_plot_widgets():
+            plot.getPlotItem().getAxis('left').setStyle(
+                autoExpandTextSpace=False, tickTextWidth=tick_width)
+
+        pwm_plot = self.graphWidgetPWM.getPlotItem()
+        self.current_viewbox = pg.ViewBox(enableMenu=False)
+        self.current_viewbox.setMouseEnabled(x=False, y=False)
+        self.current_viewbox.setZValue(pwm_plot.vb.zValue() - 1)
+        pwm_plot.scene().addItem(self.current_viewbox)
+        pwm_plot.getAxis('right').linkToView(self.current_viewbox)
+        pwm_plot.getAxis('right').setLabel('Motor current', units='mA', color='#00ffff')
+        pwm_plot.getAxis('right').enableAutoSIPrefix(False)
+        pwm_plot.getAxis('right').setStyle(autoExpandTextSpace=False, tickTextWidth=tick_width)
+        self.current_viewbox.setXLink(pwm_plot.vb)
+        self.curve_current = pg.PlotDataItem(pen=pg.mkPen('c', width=2), connect="finite",
+                                            stepMode=self._pg_step_mode())
+        self.current_viewbox.addItem(self.curve_current)
+        self.curve_current.hide()
+        self._current_is_visible = False
+        # Reserve the same right margin above, so the linked plots keep their
+        # full shared time span when the current axis becomes visible.
+        rpm_right = self.graphWidgetRPM.getPlotItem().getAxis('right')
+        rpm_right.setStyle(showValues=False, tickLength=0)
+        rpm_right.setPen(pg.mkPen(None))
+        pwm_plot.vb.sigResized.connect(self._sync_current_viewbox)
+        pwm_plot.getAxis('right').geometryChanged.connect(self._sync_current_viewbox)
+        self._sync_current_viewbox()
+
+        self.rpm_average_checkbox.toggled.connect(self._update_telemetry_overlays)
+        self.motor_current_checkbox.toggled.connect(self._update_telemetry_overlays)
+        self.modooperacion.currentTextChanged.connect(self._update_telemetry_overlays)
+        self._update_telemetry_overlays()
+
+    def _sync_current_viewbox(self):
+        pwm_view = self.graphWidgetPWM.getPlotItem().vb
+        self.current_viewbox.setGeometry(pwm_view.sceneBoundingRect())
+        self.current_viewbox.linkedViewChanged(pwm_view, pg.ViewBox.XAxis)
+        if self._current_is_visible:
+            self.graphWidgetRPM.getPlotItem().getAxis('right').setWidth(
+                self.graphWidgetPWM.getPlotItem().getAxis('right').width())
+
+    def _update_telemetry_overlays(self, *_args, time_s=None, rpm=None):
+        rpm_visible = self.rpm_average_checkbox.isChecked() and "Position" not in self.modooperacion.currentText()
+        current_visible = self.motor_current_checkbox.isChecked()
+        for visible, previous, curve, legend, name in (
+                (rpm_visible, self._rpm_average_is_visible, self.curve_rpm_average,
+                 self.legendRPM, "RPM average"),
+                (current_visible, self._current_is_visible, self.curve_current,
+                 self.legendPWM, "Motor current")):
+            if visible != previous:
+                if visible:
+                    legend.addItem(curve, name)
+                else:
+                    legend.removeItem(curve)
+            curve.setVisible(visible)
+        self._rpm_average_is_visible = rpm_visible
+        self._current_is_visible = current_visible
+        self.graphWidgetPWM.getPlotItem().showAxis('right', current_visible)
+        self.graphWidgetRPM.getPlotItem().showAxis('right', current_visible)
+        self.current_viewbox.setVisible(current_visible)
+        self._sync_current_viewbox()
+
+        if time_s is None:
+            n = min(len(self.dataDT), len(self.dataRPM_measured), len(self.dataPWM),
+                    len(self.dataRPM_setpoint))
+            time_s = np.cumsum(np.asarray(self.dataDT, dtype=float)[-n:] * 1e-3) if n else np.array([])
+            if n:
+                time_s -= time_s[0]
+            rpm = np.asarray(self.dataRPM_measured, dtype=float)[-n:] if n else np.array([])
+        n = len(time_s)
+        if rpm_visible and n:
+            self.curve_rpm_average.setData(time_s, centered_moving_average(time_s, rpm),
+                                           stepMode=self._pg_step_mode())
+        else:
+            self.curve_rpm_average.setData([], [])
+        if current_visible and n:
+            current = np.full(n, np.nan)
+            available = min(n, len(self.dataCurrent))
+            if available:
+                current[-available:] = np.asarray(self.dataCurrent, dtype=float)[-available:]
+            finite_current = current[np.isfinite(current)]
+            if len(finite_current):
+                self.curve_current.setData(time_s, current, stepMode=self._pg_step_mode())
+                self.current_viewbox.setYRange(min(0.0, float(finite_current.min())),
+                                               max(1.0, float(finite_current.max())), padding=0.08)
+            else:
+                self.curve_current.setData([], [])
+        else:
+            self.curve_current.setData([], [])
+
     def _on_plot_mode_changed(self, _text=None):
         # Restyle the original samples; no acquisition, fitting or simulation runs.
         for widget in (self.graphWidgetRPM, self.graphWidgetPWM,
@@ -2824,6 +2957,9 @@ class MyDialog(QtWidgets.QDialog):
                 if x is None or y is None:
                     x, y = [], []
                 curve.setData(x, y, stepMode=self._pg_step_mode())
+        x, y = self.curve_current.getOriginalDataset()
+        self.curve_current.setData(x if x is not None else [], y if y is not None else [],
+                                   stepMode=self._pg_step_mode())
         # Includes response plots in enlarged dialogs parented to the main GUI.
         for canvas in self.findChildren(FigureCanvas):
             changed = False
@@ -2848,16 +2984,43 @@ class MyDialog(QtWidgets.QDialog):
                 Qt.CursorShape.OpenHandCursor if enabled else Qt.CursorShape.ArrowCursor
             )
 
+    def _refresh_runtime_plots(self):
+        n = min(len(self.dataDT), len(self.dataRPM_setpoint), len(self.dataRPM_measured), len(self.dataPWM))
+        if not n:
+            return
+        time_s = np.cumsum(np.asarray(self.dataDT, dtype=float)[-n:] * 1e-3)
+        time_s -= time_s[0]
+        if n > 1 and time_s[-1] > time_s[0]:
+            self.graphWidgetRPM.setXRange(float(time_s[0]), float(time_s[-1]), padding=0)
+            self.graphWidgetPWM.setXRange(float(time_s[0]), float(time_s[-1]), padding=0)
+        setpoint = np.asarray(self.dataRPM_setpoint, dtype=float)[-n:]
+        measured = np.asarray(self.dataRPM_measured, dtype=float)[-n:]
+        pwm = np.asarray(self.dataPWM, dtype=float)[-n:]
+        self.curve_setpoint.setData(time_s, setpoint, stepMode=self._pg_step_mode())
+        self.curve_measured.setData(time_s, measured, stepMode=self._pg_step_mode())
+        self.curve_pwm.setData(time_s, pwm, stepMode=self._pg_step_mode())
+        if "Position" in self.modooperacion.currentText():
+            ymin = float(min(setpoint.min(initial=0), measured.min(initial=0)))
+            ymax = float(max(setpoint.max(initial=0), measured.max(initial=0)))
+            self._set_plot_y_range(self.graphWidgetRPM, ymin, ymax)
+        else:
+            ymax = float(max(setpoint.max(initial=0), measured.max(initial=0), 1.0))
+            self._set_plot_y_range(self.graphWidgetRPM, 0.0, ymax, include_zero=True)
+        self._set_plot_y_range(self.graphWidgetPWM, 0.0, float(max(pwm.max(initial=0), 1.0)), include_zero=True)
+        self._update_telemetry_overlays(time_s=time_s, rpm=measured)
+
     def _reset_runtime_plots(self):
         datapoints = self.dataRPM_setpoint.maxlen or 1000
         self.dataRPM_setpoint = deque(maxlen=datapoints)
         self.dataRPM_measured = deque(maxlen=datapoints)
         self.dataPWM = deque(maxlen=datapoints)
         self.dataDT = deque(maxlen=datapoints)
+        self.dataCurrent = deque(maxlen=datapoints)
 
         self.curve_setpoint.setData([], [])
         self.curve_measured.setData([], [])
         self.curve_pwm.setData([], [])
+        self._update_telemetry_overlays()
         self.graphWidgetRPM.setXRange(0.0, 1.0, padding=0)
         self.graphWidgetPWM.setXRange(0.0, 1.0, padding=0)
         self.graphWidgetRPM.setYRange(0.0, 120.0)
@@ -4136,6 +4299,8 @@ class MyDialog(QtWidgets.QDialog):
         self.dataRPM_measured = deque(list(self.dataRPM_measured)[-datapoints:], maxlen=datapoints)
         self.dataPWM = deque(list(self.dataPWM)[-datapoints:], maxlen=datapoints)
         self.dataDT = deque(list(self.dataDT)[-datapoints:], maxlen=datapoints)
+        self.dataCurrent = deque(list(self.dataCurrent)[-datapoints:], maxlen=datapoints)
+        self._refresh_runtime_plots()
 
     def _read_float(self, le):
         """Read float from QLineEdit. Empty/invalid -> 0."""
@@ -4723,6 +4888,9 @@ class MyDialog(QtWidgets.QDialog):
                 self.dataRPM_measured.append(meas)
                 self.dataPWM.append(pwm)
                 self.dataDT.append(dt_ms)
+                # Six-field Teensy frames already contain calibrated, filtered
+                # current. The five-field legacy frame contains unscaled ADC.
+                self.dataCurrent.append(current_avg if has_current_avg else np.nan)
 
                 # Save this sample if requested
                 if self.saveValuesCheckBox.isChecked():
@@ -4756,38 +4924,8 @@ class MyDialog(QtWidgets.QDialog):
                                 f"{raw_current:.2f},{pwm:.9g}{dmm_suffix}\n"
                             )
 
-            # ----- Plot latest window (equal-length slices) -----
-            if not self.isRunning:
-                return
-            N = min(len(self.dataDT), len(self.dataRPM_setpoint), len(self.dataRPM_measured), len(self.dataPWM))
-            if N == 0:
-                return
-
-            dt_s = np.asarray(self.dataDT, dtype=float)[-N:] * 1e-3
-            t = np.cumsum(dt_s); t -= t[0]
-
-            if len(t) > 1 and float(t[-1]) > float(t[0]):
-                xmin = float(t[0])
-                xmax = float(t[-1])
-                self.graphWidgetRPM.setXRange(xmin, xmax, padding=0)
-                self.graphWidgetPWM.setXRange(xmin, xmax, padding=0)
-
-            y_sp  = np.asarray(self.dataRPM_setpoint, dtype=float)[-N:]
-            y_mea = np.asarray(self.dataRPM_measured, dtype=float)[-N:]
-            y_pwm = np.asarray(self.dataPWM, dtype=float)[-N:]
-
-            self.curve_setpoint.setData(t, y_sp, stepMode=self._pg_step_mode())
-            self.curve_measured.setData(t, y_mea, stepMode=self._pg_step_mode())
-            self.curve_pwm.setData(t, y_pwm, stepMode=self._pg_step_mode())
-
-            if "Position" in self.modooperacion.currentText():
-                ymin = float(min(y_sp.min(initial=0), y_mea.min(initial=0)))
-                ymax = float(max(y_sp.max(initial=0), y_mea.max(initial=0)))
-                self._set_plot_y_range(self.graphWidgetRPM, ymin, ymax)
-            else:
-                ymax = float(max(y_sp.max(initial=0), y_mea.max(initial=0), 1.0))
-                self._set_plot_y_range(self.graphWidgetRPM, 0.0, ymax, include_zero=True)
-            self._set_plot_y_range(self.graphWidgetPWM, 0.0, float(max(y_pwm.max(initial=0), 1.0)), include_zero=True)
+            if self.isRunning:
+                self._refresh_runtime_plots()
 
         except Exception as e:
             print("update_graph error:", e)

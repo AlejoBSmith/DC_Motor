@@ -618,55 +618,134 @@
        </widget>
       </item>
       <item>
-       <widget class="QSplitter" name="live_plots">
-        <property name="orientation">
-         <enum>Qt::Vertical</enum>
-        </property>
-        <property name="childrenCollapsible">
-         <bool>false</bool>
-        </property>
-        <property name="minimumSize">
-         <size>
-          <width>260</width>
-          <height>0</height>
-         </size>
-        </property>
-        <property name="maximumSize">
-         <size>
-          <width>16777215</width>
-          <height>16777215</height>
-         </size>
-        </property>
+       <widget class="QWidget" name="telemetry_column">
         <property name="sizePolicy">
          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
           <horstretch>1</horstretch>
           <verstretch>0</verstretch>
          </sizepolicy>
         </property>
-        <property name="geometry">
-         <rect>
-          <x>0</x>
-          <y>0</y>
-          <width>620</width>
-          <height>700</height>
-         </rect>
-        </property>
-        <widget class="PlotWidget" name="graphWidgetRPM">
-         <property name="minimumSize">
-          <size>
-           <width>260</width>
-           <height>150</height>
-          </size>
+        <layout class="QVBoxLayout" name="telemetry_column_layout" stretch="1,0">
+         <property name="leftMargin">
+          <number>0</number>
          </property>
-        </widget>
-        <widget class="PlotWidget" name="graphWidgetPWM">
-         <property name="minimumSize">
-          <size>
-           <width>260</width>
-           <height>150</height>
-          </size>
+         <property name="topMargin">
+          <number>0</number>
          </property>
-        </widget>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+         <property name="spacing">
+          <number>6</number>
+         </property>
+         <item>
+          <widget class="QSplitter" name="live_plots">
+           <property name="orientation">
+            <enum>Qt::Vertical</enum>
+           </property>
+           <property name="childrenCollapsible">
+            <bool>false</bool>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>260</width>
+             <height>0</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>16777215</width>
+             <height>16777215</height>
+            </size>
+           </property>
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+             <horstretch>1</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+             <y>0</y>
+             <width>620</width>
+             <height>700</height>
+            </rect>
+           </property>
+           <widget class="PlotWidget" name="graphWidgetRPM">
+            <property name="minimumSize">
+             <size>
+              <width>260</width>
+              <height>150</height>
+             </size>
+            </property>
+           </widget>
+           <widget class="PlotWidget" name="graphWidgetPWM">
+            <property name="minimumSize">
+             <size>
+              <width>260</width>
+              <height>150</height>
+             </size>
+            </property>
+           </widget>
+          </widget>
+         </item>
+         <item>
+          <layout class="QHBoxLayout" name="telemetry_options_layout">
+           <property name="spacing">
+            <number>6</number>
+           </property>
+           <item>
+            <widget class="QCheckBox" name="rpm_average_checkbox">
+             <property name="enabled">
+              <bool>true</bool>
+             </property>
+             <property name="text">
+              <string>RPM moving average</string>
+             </property>
+             <property name="toolTip">
+              <string>Centered 30 ms average (at least 3 samples). Display only.</string>
+             </property>
+             <property name="checked">
+              <bool>false</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <spacer name="telemetry_options_spacer">
+             <property name="orientation">
+              <enum>Qt::Horizontal</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>0</width>
+               <height>0</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="motor_current_checkbox">
+             <property name="enabled">
+              <bool>true</bool>
+             </property>
+             <property name="text">
+              <string>Motor current</string>
+             </property>
+             <property name="toolTip">
+              <string>Filtered current from the controller, in mA, on the right axis.</string>
+             </property>
+             <property name="checked">
+              <bool>false</bool>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </item>
+        </layout>
        </widget>
       </item>
       <item>
